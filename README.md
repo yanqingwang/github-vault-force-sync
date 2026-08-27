@@ -29,7 +29,7 @@ An [Obsidian](https://obsidian.md) plugin that syncs your entire vault to a GitH
 
 ### From the community directory
 
-> Pending review — submitted to the Obsidian community plugin directory.
+> Not yet listed — the plugin is being submitted for review. Until it appears in the community directory, use manual install or BRAT below.
 
 ### Manual install
 
