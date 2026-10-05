@@ -33,13 +33,13 @@ An [Obsidian](https://obsidian.md) plugin that syncs your entire vault to a GitH
 
 ### Manual install
 
-1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/yanqingwang/vault-github-with-force/releases).
+1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/yanqingwang/github-vault-force-sync/releases).
 2. Create `<vault>/.obsidian/plugins/vault-force-sync/` and copy the three files into it.
 3. Reload Obsidian and enable **Vault Force Sync** in Settings → Community plugins.
 
 ### Beta testing via BRAT
 
-Add `yanqingwang/vault-github-with-force` as a beta plugin in [BRAT](https://github.com/TfTHacker/obsidian42-brat).
+Add `yanqingwang/github-vault-force-sync` as a beta plugin in [BRAT](https://github.com/TfTHacker/obsidian42-brat).
 
 ## Usage
 

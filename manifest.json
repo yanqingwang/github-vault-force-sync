@@ -1,7 +1,7 @@
 {
   "id": "vault-force-sync",
   "name": "Vault Force Sync",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "minAppVersion": "0.15.0",
   "description": "Force/incremental sync vault data to a configurable GitHub remote (git path configurable), skips >100MB files and continues; logs results to a viewable log.",
   "author": "yanqingwang",
