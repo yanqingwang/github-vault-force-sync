@@ -1,9 +1,9 @@
 {
   "id": "vault-force-sync",
   "name": "Vault Force Sync",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "minAppVersion": "0.15.0",
-  "description": "Force/incremental sync vault data to a configurable GitHub remote (git path configurable), skips >100MB files and continues; logs results to a viewable log.",
+  "description": "Two-way sync between your vault and a GitHub remote: pulls remote changes and pushes local ones, on demand or on a timer. Integrates the remote with merge or rebase instead of forcing, skips >100MB files, and rolls back cleanly on conflict.",
   "author": "yanqingwang",
   "isDesktopOnly": true
 }

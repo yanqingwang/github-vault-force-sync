@@ -1,25 +1,46 @@
-// Vault Force Sync — sync all vault data to a GitHub remote, excluding
-// dotfiles and hidden files.
+// Vault Force Sync — two-way sync between the vault and a GitHub remote.
 //
 // Desktop only. Uses the system `git` (must be on PATH).
 // Conventions:
 //   - runs inside the vault repo (the vault itself is the git work tree)
 //   - writes `.gitignore` (.* / !/.gitignore) so dotfiles never get tracked
 //   - optionally configures an HTTP(S) proxy + large http.postBuffer for big pushes
-//   - incremental sync: `git add -A` -> commit (timestamp) -> fetch remote ->
-//     push. Only new commits (the delta since last sync) are uploaded.
+//   - one sync is: stage -> commit -> fetch -> integrate remote -> push. Only
+//     the delta since the last sync moves, in both directions.
 //   - logs every sync run to `<vault>/.obsidian/plugins/vault-force-sync/sync.log`
 //     (local only — `.obsidian` is gitignored), viewable via the "Open sync log"
 //     command or the button in settings.
 //
+// Why commit *before* integrating: `git rebase` refuses to run with unstaged
+// changes, and a merge would otherwise have to resolve our own brand-new commit
+// against the remote. Staging first means the tree is clean by the time we
+// integrate, and the local change is rebased/merged as a whole unit.
+//
 // Push modes:
-//   incremental : normal `git push` only; never overwrite remote.
+//   incremental : normal `git push` only; never overwrite remote. Divergence is
+//                 resolved by integrating the remote, not by discarding it.
 //   auto        : normal push; auto force-with-lease only when remote is
 //                 strictly behind local (local history rewritten). Never
 //                 overwrites diverged remote commits.
 //   force       : always `git push --force-with-lease`.
+//
+// Integration strategies (only reached in incremental/auto mode):
+//   merge  : `git merge origin/<branch>`. Keeps existing commit hashes, so
+//            nothing already on the remote is ever rewritten. One conflict to
+//            resolve per sync round.
+//   rebase : `git rebase origin/<branch>`. Linear history, nicer to read in a
+//            backup repo. Only local (not yet pushed) commits are replayed.
 
-const { Plugin, Notice, PluginSettingTab, Setting, Modal } = require("obsidian");
+const {
+  Plugin,
+  Notice,
+  PluginSettingTab,
+  Setting,
+  Modal,
+  // Arrived in Obsidian 1.11.4. `undefined` on anything older, which the
+  // credentials row checks before trying to render it.
+  SecretComponent,
+} = require("obsidian");
 const { execFile } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -36,23 +57,97 @@ const PUSH_MODES = {
   force: "Always force",
 };
 
+// How the remote is brought into the local branch. Never used in `force` mode,
+// where the point is to discard the remote instead.
+const SYNC_STRATEGIES = {
+  merge: "Merge (default, safest)",
+  rebase: "Rebase (linear history)",
+};
+
 const DEFAULT_SETTINGS = {
   remoteUrl: "",
   gitLocation: "",
   proxy: "",
   branch: "main",
   pushMode: "incremental",
+  syncStrategy: "merge",
   autoSyncOnLoad: false,
+  // 0 disables the timer. 5 keeps a vault reasonably current, and every run is
+  // guarded against overlapping the one before it.
+  autoSyncIntervalMin: 5,
+  // Obsidian has no merge UI. Leaving `<<<<<<<` markers sitting in notes that
+  // nobody opens is the worst outcome, so a conflicted sync is rolled back to
+  // the pre-sync state and reported. Nothing is lost: local commits stay put and
+  // the remote is never touched.
+  autoAbortConflicts: true,
+  // Optional explicit credentials. Empty means "whatever this machine's git
+  // already uses", which is the shipped default and the only path that existed
+  // before these two keys were added.
+  credentialUsername: "",
+  credentialSecretId: "",
   showSuccessNotice: true,
   enableLogging: true,
   maxFileSizeMB: 100,
 };
+
+// Git calls an askpass program with the prompt as its only argument and reads the
+// answer from stdout.
+//
+// The credential travels in the environment instead of being written into these
+// files, so generating them leaves no token on disk. That is the whole reason a
+// helper is needed at all: `GIT_ASKPASS` has to be a path, but nothing requires
+// the secret to live at it.
+const ASKPASS_POSIX = [
+  "#!/bin/sh",
+  "# Written by Vault Force Sync. Safe to delete: it is rewritten on every sync.",
+  "# The credential comes from the environment, so no token is stored here.",
+  'case "$1" in',
+  "  *sername*) printf '%s\n' \"$VFS_GIT_USERNAME\" ;;",
+  "  *)         printf '%s\n' \"$VFS_GIT_TOKEN\" ;;",
+  "esac",
+  "",
+].join("\n");
+
+// The batch version echoes the variables, so a token containing cmd metacharacters
+// (& ^ |) would be mangled. GitHub's own tokens are alphanumeric plus underscore,
+// which is the case this exists for, so the extra quoting machinery is not earned.
+const ASKPASS_WINDOWS = [
+  "@echo off",
+  "REM Written by Vault Force Sync. Safe to delete: it is rewritten on every sync.",
+  "REM The credential comes from the environment, so no token is stored here.",
+  'echo %~1 | findstr /I "sername" >nul',
+  "if errorlevel 1 (echo %VFS_GIT_TOKEN%) else (echo %VFS_GIT_USERNAME%)",
+  "",
+].join("\r\n");
 
 const GITIGNORE_CONTENT = [
   "# Vault Force Sync: exclude dotfiles / hidden files",
   ".*",
   "!/.gitignore",
 ].join("\n") + "\n";
+
+// Obsidian's `Setting.onChange` / `Button.onClick` declare `=> void`. Handing them an
+// `async` arrow passes a promise nobody awaits, so a rejected save becomes an
+// unhandled rejection: the user clicks, nothing appears to happen, and the setting
+// silently reverts on the next launch. This keeps the body async but makes the arrow
+// synchronous, and turns a rejected save into a Notice.
+function fire(body) {
+  return function () {
+    let out;
+    try {
+      out = body.apply(null, arguments);
+    } catch (err) {
+      reportFailure(err);
+      return;
+    }
+    if (out && typeof out.catch === "function") out.catch(reportFailure);
+  };
+}
+
+function reportFailure(err) {
+  new Notice("Vault Force Sync: " + (err && err.message ? err.message : String(err)), 8000);
+  console.error("[Vault Force Sync]", err);
+}
 
 function getVaultPath(app) {
   const adapter = app.vault.adapter;
@@ -62,17 +157,42 @@ function getVaultPath(app) {
   return null;
 }
 
-function runGit(cwd, gitBin, args) {
+// Absolute path to this plugin's own folder.
+//
+// `Vault#configDir` is the config folder's *name*, not a path -- Obsidian's own
+// docs call it "the path to the config folder. This value is typically .obsidian".
+// `fs` resolves a relative path against `process.cwd()`, which is the Obsidian
+// install directory and not the vault, so the two must be joined before any `fs`
+// call sees it. An already-absolute `configDir` is passed through untouched, so
+// either shape lands in the right place.
+function configDirPath(app, vaultPath) {
+  const configDir = app && app.vault && app.vault.configDir;
+  if (!configDir) return null;
+  if (path.isAbsolute(configDir)) return configDir;
+  if (!vaultPath) return null;
+  return path.join(vaultPath, configDir);
+}
+
+function pluginDir(app) {
+  const base = configDirPath(app, getVaultPath(app));
+  return base ? path.join(base, "plugins", "vault-force-sync") : null;
+}
+
+function runGit(cwd, gitBin, args, env) {
   return new Promise((resolve) => {
+    const options = {
+      cwd,
+      maxBuffer: 64 * 1024 * 1024,
+      windowsHide: true,
+      timeout: GIT_TIMEOUT_MS,
+    };
+    // Left unset when there is nothing to inject, so git inherits the ambient
+    // environment exactly as it always has.
+    if (env) options.env = env;
     execFile(
       gitBin,
       args,
-      {
-        cwd,
-        maxBuffer: 64 * 1024 * 1024,
-        windowsHide: true,
-        timeout: GIT_TIMEOUT_MS,
-      },
+      options,
       (error, stdout, stderr) => {
         // Non-zero exit (e.g. `diff --cached --quiet`) is a normal signal,
         // not a crash. Only unexpected conditions become fatal.
@@ -133,10 +253,28 @@ class VaultForceSyncPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
+    // Guards every sync entry point (ribbon, commands, timer). Two concurrent
+    // syncs would race on the same index and can leave a half-applied merge
+    // behind, so a trigger arriving mid-run is dropped rather than queued.
+    this.syncing = false;
+    this.syncTimer = null;
+
     this.addCommand({
       id: "sync",
-      name: "Sync vault to remote (incremental)",
+      name: "Sync vault with remote (pull + push)",
       callback: () => this.runSync(),
+    });
+
+    this.addCommand({
+      id: "pull",
+      name: "Pull remote changes only",
+      callback: () => this.runPull(),
+    });
+
+    this.addCommand({
+      id: "status",
+      name: "Show sync status",
+      callback: () => this.runStatus(),
     });
 
     this.addCommand({
@@ -160,9 +298,31 @@ class VaultForceSyncPlugin extends Plugin {
         setTimeout(() => this.runSync(), 3000);
       });
     }
+
+    this.startTimer();
   }
 
-  onunload() {}
+  onunload() {
+    this.stopTimer();
+  }
+
+  // Periodic sync. The handle is swapped rather than reconfigured, because the
+  // settings tab calls this after every change and replacing it is the only way
+  // to be sure the previous interval was actually cleared.
+  startTimer() {
+    this.stopTimer();
+    const mins = Math.max(0, parseInt(this.settings.autoSyncIntervalMin, 10) || 0);
+    if (mins === 0) return;
+    this.syncTimer = setInterval(() => this.runSync(), mins * 60 * 1000);
+    this.log(`auto sync timer armed: every ${mins} min`);
+  }
+
+  stopTimer() {
+    if (this.syncTimer) {
+      clearInterval(this.syncTimer);
+      this.syncTimer = null;
+    }
+  }
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -178,9 +338,13 @@ class VaultForceSyncPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  // The log lives in the plugin's own folder, which sits under the vault's config
+  // directory -- and that directory is not necessarily called `.obsidian`, since the
+  // user can point Obsidian anywhere. Hard-coding the name puts the log somewhere the
+  // vault never looks, and "Open sync log" then reports an empty file.
   getLogPath() {
-    const vp = getVaultPath(this.app);
-    return vp ? path.join(vp, ".obsidian", "plugins", "vault-force-sync", "sync.log") : null;
+    const dir = pluginDir(this.app);
+    return dir ? path.join(dir, "sync.log") : null;
   }
 
   log(message) {
@@ -247,7 +411,104 @@ class VaultForceSyncPlugin extends Plugin {
     this.notify(message, error);
   }
 
+  // True when git is part-way through a merge/rebase it could not finish.
+  // Committing or integrating on top of that state would bake conflict markers
+  // into the vault's history, so every sync refuses to run until it is resolved
+  // or aborted.
+  async integrationInProgress(vaultPath) {
+    const head = await this.git(vaultPath, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+    if (head.code === 0) return "merge";
+    for (const dir of ["rebase-merge", "rebase-apply"]) {
+      if (fs.existsSync(path.join(vaultPath, ".git", dir))) return "rebase";
+    }
+    return null;
+  }
+
+  async conflictedFiles(vaultPath) {
+    const res = await this.git(vaultPath, ["diff", "--name-only", "--diff-filter=U"]);
+    if (res.code !== 0) return [];
+    return res.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  }
+
+  // Fold the remote branch into the local one.
+  //
+  // This is the piece that makes sync two-way. In incremental/auto mode it is
+  // the *only* way divergence is ever resolved -- the alternative the plugin
+  // used to offer was refusing to sync until the user went and pulled by hand.
+  // Returns true when the tree is ready to push.
+  async integrateRemote(vaultPath, branch, mode) {
+    const strategy = this.settings.syncStrategy === "rebase" ? "rebase" : "merge";
+
+    // `force` exists to discard the remote, so integrating would defeat it.
+    if (mode === "force") {
+      this.log("force mode: skipping remote integration");
+      return true;
+    }
+
+    const args =
+      strategy === "rebase"
+        ? ["rebase", `origin/${branch}`]
+        : ["merge", "--no-edit", `origin/${branch}`];
+
+    const res = await this.git(vaultPath, args);
+    if (res.code === 0) {
+      this.log(`integrated remote via ${args[0]} ${args.slice(1).join(" ")}`);
+      return true;
+    }
+
+    const files = await this.conflictedFiles(vaultPath);
+    const kind = await this.integrationInProgress(vaultPath);
+
+    // A non-zero exit with nothing left in progress means git refused for some
+    // other reason (dirty tree, bad ref). Do not pretend it was a conflict.
+    if (!kind) {
+      this.report("Could not integrate remote " + branch + ": " + res.stderr.trim(), true);
+      return false;
+    }
+
+    if (this.settings.autoAbortConflicts) {
+      const abortArgs = kind === "rebase" ? ["rebase", "--abort"] : ["merge", "--abort"];
+      await this.git(vaultPath, abortArgs);
+      this.log(`aborted ${kind} after conflict on ${files.length} file(s)`);
+      const preview = files.slice(0, 8).join(", ") + (files.length > 8 ? " …" : "");
+      this.report(
+        `Remote ${branch} changed the same notes you did (${files.length} conflict(s)). ` +
+          `Nothing was overwritten — the sync was rolled back and your local notes are untouched. ` +
+          `Conflicting: ${preview}. ` +
+          `Resolve them by hand and commit, or set "Auto-abort sync conflicts" off to stop here and resolve interactively.`,
+        true
+      );
+      return false;
+    }
+
+    const preview = files.slice(0, 8).join(", ") + (files.length > 8 ? " …" : "");
+    this.report(
+      `Sync stopped: ${kind} conflict on ${files.length} note(s): ${preview}. ` +
+        `Finish or abort it with git in this vault, then sync again.`,
+      true
+    );
+    return false;
+  }
+
+  // Count how far local and remote have drifted. Returns null when the remote
+  // branch does not exist yet (a fresh repo), which is a different situation
+  // rather than an error.
+  async divergence(vaultPath, branch) {
+    const ahead = await this.git(vaultPath, ["rev-list", "--count", `origin/${branch}..HEAD`]);
+    const behind = await this.git(vaultPath, ["rev-list", "--count", `HEAD..origin/${branch}`]);
+    if (ahead.code !== 0 || behind.code !== 0) {
+      return { error: (ahead.stderr + behind.stderr).trim() };
+    }
+    return { ahead: parseInt(ahead.stdout, 10) || 0, behind: parseInt(behind.stdout, 10) || 0 };
+  }
+
   async runSync(forceMode) {
+    if (this.syncing) {
+      this.log("sync skipped: another sync is already running");
+      return;
+    }
+    this.syncing = true;
+
     const start = Date.now();
     const mode = forceMode || this.settings.pushMode;
     this.log(`=== sync start | mode=${mode} | target=${this.settings.remoteUrl || "origin (existing)"} ===`);
@@ -255,6 +516,16 @@ class VaultForceSyncPlugin extends Plugin {
       const vaultPath = getVaultPath(this.app);
       if (!vaultPath) {
         this.report("Could not determine vault path (desktop only).", true);
+        return;
+      }
+
+      const busy = await this.integrationInProgress(vaultPath);
+      if (busy) {
+        this.report(
+          `A ${busy} from a previous sync is still unresolved, so nothing was touched. ` +
+            `Finish it with git in this vault, or run "git ${busy === "merge" ? "merge" : "rebase"} --abort".`,
+          true
+        );
         return;
       }
 
@@ -306,38 +577,55 @@ class VaultForceSyncPlugin extends Plugin {
       const secs = ((Date.now() - start) / 1000).toFixed(1);
 
       if (!remoteExists) {
-        // Remote branch does not exist yet (fresh repo) — plain push.
+        // Remote branch does not exist yet (fresh repo) — plain push creates it.
         this.log(`remote branch ${branch} does not exist yet`);
         await this.push(vaultPath, ["push", "-u", "origin", branch], mode, secs);
         return;
       }
 
-      const ahead = await this.git(vaultPath, ["rev-list", "--count", `origin/${branch}..HEAD`]);
-      const behind = await this.git(vaultPath, ["rev-list", "--count", `HEAD..origin/${branch}`]);
-      if (ahead.code !== 0 || behind.code !== 0) {
-        this.report("Could not compare with remote: " + (ahead.stderr + behind.stderr).trim(), true);
+      const d = await this.divergence(vaultPath, branch);
+      if (d.error !== undefined) {
+        this.report("Could not compare with remote: " + d.error, true);
         return;
       }
-      const aheadN = parseInt(ahead.stdout, 10) || 0;
-      const behindN = parseInt(behind.stdout, 10) || 0;
+      const aheadN = d.ahead;
+      const behindN = d.behind;
       this.log(`ahead=${aheadN} behind=${behindN}`);
 
-      if (behindN > 0 && aheadN > 0) {
-        // Diverged: remote has commits we don't have.
-        if (mode === "force") {
-          await this.push(vaultPath, ["push", "--force-with-lease", "origin", branch], mode, secs);
-        } else {
-          this.report(
-            `Remote ${branch} has ${behindN} commit(s) you don't have. ` +
-              "Incremental/auto sync will not overwrite them. Pull first, or use Force push.",
-            true
-          );
+      // The two-way step. Whatever the remote gained is folded into the local
+      // branch before anything is uploaded, so local commits are pushed on top
+      // of remote history rather than against it.
+      if (behindN > 0 && mode !== "force") {
+        const clean = await this.integrateRemote(vaultPath, branch, mode);
+        if (!clean) return;
+
+        // Re-read: integrating may have introduced commits that also need pushing.
+        const after = await this.divergence(vaultPath, branch);
+        if (after.error !== undefined) {
+          this.report("Pulled, but could not re-check divergence: " + after.error, true);
+          return;
         }
+        if (after.ahead === 0) {
+          this.report(
+            `Pulled ${behindN} commit(s) from origin/${branch}. Nothing to push.`,
+            false,
+            secs
+          );
+          return;
+        }
+        await this.push(vaultPath, ["push", "origin", branch], mode, secs, `pulled ${behindN}`);
+        return;
+      }
+
+      if (behindN > 0 && aheadN > 0) {
+        // Diverged and `force` was chosen: overwrite the remote by request.
+        await this.push(vaultPath, ["push", "--force-with-lease", "origin", branch], mode, secs);
         return;
       }
 
       if (behindN > 0) {
-        this.report(`Remote ${branch} is ${behindN} commit(s) ahead — nothing to push. Pull to update.`, true);
+        // Diverged in `force` mode with nothing local to lose.
+        this.report(`Remote ${branch} is ${behindN} commit(s) ahead — nothing to push.`, true);
         return;
       }
 
@@ -354,10 +642,109 @@ class VaultForceSyncPlugin extends Plugin {
       }
     } catch (err) {
       this.report(String(err && err.message ? err.message : err), true);
+    } finally {
+      // Every early return above lands here, so the guard is released on all
+      // paths — including the exceptions. Leaking it would wedge sync forever.
+      this.syncing = false;
     }
   }
 
-  async push(vaultPath, args, mode, secs) {
+  // Remote-only: fetch and integrate, never commit or push. Useful when you want
+  // to see what the other device did before sending anything back.
+  async runPull() {
+    if (this.syncing) {
+      this.log("pull skipped: a sync is already running");
+      return;
+    }
+    this.syncing = true;
+    const start = Date.now();
+    try {
+      const vaultPath = getVaultPath(this.app);
+      if (!vaultPath) {
+        this.report("Could not determine vault path (desktop only).", true);
+        return;
+      }
+      const busy = await this.integrationInProgress(vaultPath);
+      if (busy) {
+        this.report(`A ${busy} from a previous sync is still unresolved, so nothing was touched.`, true);
+        return;
+      }
+
+      const branch = this.settings.branch;
+      this.log(`=== pull start | branch=${branch} ===`);
+      const fetchRes = await this.git(vaultPath, ["fetch", "origin", branch]);
+      const refRes = await this.git(vaultPath, ["rev-parse", "--verify", `refs/remotes/origin/${branch}`]);
+      if (refRes.code !== 0) {
+        this.report(`Remote branch ${branch} does not exist yet — nothing to pull.`, true);
+        return;
+      }
+      if (fetchRes.code !== 0) {
+        this.report("Fetch failed: " + fetchRes.stderr.trim(), true);
+        return;
+      }
+
+      const d = await this.divergence(vaultPath, branch);
+      if (d.error !== undefined) {
+        this.report("Could not compare with remote: " + d.error, true);
+        return;
+      }
+      if (d.behind === 0) {
+        this.report(`Already up to date with origin/${branch}.`, false);
+        return;
+      }
+
+      if (!(await this.integrateRemote(vaultPath, branch, this.settings.pushMode))) return;
+      this.report(`Pulled ${d.behind} commit(s) from origin/${branch}.`, false, ((Date.now() - start) / 1000).toFixed(1));
+    } catch (err) {
+      this.report(String(err && err.message ? err.message : err), true);
+    } finally {
+      this.syncing = false;
+    }
+  }
+
+  async runStatus() {
+    try {
+      const vaultPath = getVaultPath(this.app);
+      if (!vaultPath) {
+        this.report("Could not determine vault path (desktop only).", true);
+        return;
+      }
+      const branch = this.settings.branch;
+      await this.git(vaultPath, ["fetch", "--quiet", "origin", branch]);
+
+      const branchRes = await this.git(vaultPath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+      const head = branchRes.code === 0 ? branchRes.stdout.trim() : "?";
+      const headSha = await this.git(vaultPath, ["rev-parse", "--short", "HEAD"]);
+      const dirty = await this.git(vaultPath, ["status", "--porcelain"]);
+
+      const refRes = await this.git(vaultPath, ["rev-parse", "--verify", `refs/remotes/origin/${branch}`]);
+      let drift = "remote branch not present yet";
+      if (refRes.code === 0) {
+        const d = await this.divergence(vaultPath, branch);
+        if (d.error === undefined) {
+          drift = d.ahead === 0 && d.behind === 0
+            ? "in sync with remote"
+            : `${d.ahead} to push, ${d.behind} to pull`;
+        }
+      }
+
+      const uncommitted = dirty.stdout.split(/\r?\n/).filter(Boolean).length;
+      new Notice(
+        `Vault Force Sync\n` +
+          `branch: ${head} (${headSha.stdout.trim()})\n` +
+          `${drift}\n` +
+          `uncommitted files: ${uncommitted}\n` +
+          `mode: ${this.settings.pushMode} / ${this.settings.syncStrategy}\n` +
+          `auto sync: every ${this.settings.autoSyncIntervalMin || 0} min`,
+        12000
+      );
+      this.log(`status | head=${headSha.stdout.trim()} | ${drift} | uncommitted=${uncommitted}`);
+    } catch (err) {
+      this.report(String(err && err.message ? err.message : err), true);
+    }
+  }
+
+  async push(vaultPath, args, mode, secs, prefix) {
     const res = await this.git(vaultPath, args);
     if (res.code !== 0) {
       let msg = `Push (${mode}) failed: ${res.stderr.trim()}`;
@@ -371,7 +758,7 @@ class VaultForceSyncPlugin extends Plugin {
     }
     const summary = res.stdout.trim().split("\n").pop() || "";
     this.log(`push args=${args.join(" ")} summary=${summary}`);
-    this.report(`Pushed ${summary} [${mode}]`, false, secs);
+    this.report(`${prefix ? prefix + ", pushed " : "Pushed "}${summary} [${mode}]`, false, secs);
   }
 
   ensureGitignore(vaultPath) {
@@ -449,9 +836,89 @@ class VaultForceSyncPlugin extends Plugin {
     }
   }
 
+  // Reads the token from Obsidian's SecretStorage, never from data.json.
+  //
+  // Returns { configured: false } when the user has not opted in, so the default
+  // path -- whatever the machine's git already uses -- is left completely alone.
+  resolveCredentials() {
+    const secretId = String(this.settings.credentialSecretId || "").trim();
+    if (!secretId) return { configured: false };
+
+    const storage = this.app.secretStorage;
+    if (!storage || typeof storage.getSecret !== "function") {
+      return {
+        configured: true,
+        error:
+          'A personal access token is selected ("' + secretId + '"), but this Obsidian version has no ' +
+          "SecretStorage API -- it arrived in 1.11.4 -- so the token cannot be read. Update Obsidian, " +
+          "or clear the token setting to go back to this machine's git credentials.",
+      };
+    }
+
+    const token = storage.getSecret(secretId);
+    if (!token) {
+      return {
+        configured: true,
+        error:
+          'The secret "' + secretId + '" is empty or missing, so the token could not be read. ' +
+          "Pick or create it again under Credentials, or clear the token setting to use this " +
+          "machine's git credentials.",
+      };
+    }
+
+    // GitHub ignores the username for HTTPS -- the token is what authenticates --
+    // but git requires a non-empty one, so this is only a placeholder.
+    const username = String(this.settings.credentialUsername || "").trim() || "x-access-token";
+    return { configured: true, username, token };
+  }
+
+  // Writes the askpass helper git will call for the username and the token.
+  // Rewritten every sync so an older version's helper cannot linger.
+  //
+  // Named as a dotfile on purpose: the plugin's own `.gitignore` rule is `.*`, so
+  // this stays untracked no matter what the vault's config folder is called. A
+  // plain name would be committed by anyone using a config folder without a
+  // leading dot.
+  ensureAskpassScript(dir) {
+    const win = process.platform === "win32";
+    const file = path.join(dir, win ? ".askpass.cmd" : ".askpass.sh");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, win ? ASKPASS_WINDOWS : ASKPASS_POSIX, { encoding: "utf8", mode: 0o700 });
+    return file;
+  }
+
+  // Git options and environment for a single command.
+  //
+  // Unconfigured: nothing is added at all.
+  // Configured: the helper *list* is cleared first. Without that, a credential
+  // already cached by gh / osxkeychain / manager-core would be tried first and
+  // silently win, making the setting look broken.
+  authFor() {
+    const cred = this.resolveCredentials();
+    if (!cred.configured) return { args: [], env: null };
+    if (cred.error) throw new Error(cred.error);
+
+    const dir = pluginDir(this.app);
+    if (!dir) throw new Error("Could not locate the plugin folder to write the askpass helper.");
+
+    return {
+      args: ["-c", "credential.helper="],
+      env: Object.assign({}, process.env, {
+        GIT_ASKPASS: this.ensureAskpassScript(dir),
+        // Without a TTY git would otherwise have nothing to prompt on, and on
+        // Windows could pop a GUI box from an unattended background sync. Failing
+        // fast beats stalling until the 5-minute timeout.
+        GIT_TERMINAL_PROMPT: "0",
+        VFS_GIT_USERNAME: cred.username,
+        VFS_GIT_TOKEN: cred.token,
+      }),
+    };
+  }
+
   async git(vaultPath, args) {
     const gitBin = (this.settings.gitLocation || "").trim() || "git";
-    const res = await runGit(vaultPath, gitBin, args);
+    const auth = this.authFor();
+    const res = await runGit(vaultPath, gitBin, auth.args.concat(args), auth.env);
     if (res.code === -1) {
       throw new Error(
         "git failed to start (check the 'Git location' setting, current: " + gitBin + "): " + res.stderr.trim()
@@ -461,149 +928,313 @@ class VaultForceSyncPlugin extends Plugin {
   }
 }
 
+// Normalise a value before it is stored. Text is trimmed, numbers become
+// integers, and anything unusable falls back to the shipped default -- so a
+// half-typed value in the settings box can never persist as something the next
+// sync cannot use.
+function coerce(key, value) {
+  const fallback = DEFAULT_SETTINGS[key];
+  if (typeof fallback === "number") {
+    const n = parseInt(value, 10);
+    if (!Number.isFinite(n)) return fallback;
+    if (key === "maxFileSizeMB") return n > 0 ? n : fallback;
+    return n >= 0 ? n : fallback;
+  }
+  if (typeof fallback === "string") return String(value == null ? "" : value).trim();
+  if (typeof fallback === "boolean") return Boolean(value);
+  return value;
+}
+
+// Values the control's own type cannot constrain. The declarative API renders a
+// returned string as an inline error, which is better than the old behaviour of
+// silently discarding a keystroke.
+function makeValidator(item) {
+  if (item.type !== "number") return undefined;
+  return (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "请输入一个数字";
+    if (item.min !== undefined && n < item.min) return "不能小于 " + item.min;
+    return undefined;
+  };
+}
+
+// Builds the credentials row.
+//
+// `SecretComponent` is the one Obsidian control with no declarative equivalent, so
+// the row is assembled by hand in *both* renderers -- which is also what stops the
+// two paths from drifting apart on it.
+function renderSecretRow(tab, setting, item) {
+  if (typeof SecretComponent !== "function") {
+    // Showing a picker that cannot save anything would be worse than saying so.
+    setting.setDesc(item.desc + " Unavailable in this Obsidian version -- needs 1.11.4 or later.");
+    return;
+  }
+
+  setting.setDesc(item.desc).addComponent((el) =>
+    new SecretComponent(tab.app, el)
+      .setValue(String(tab.getControlValue(item.key) || ""))
+      .onChange(
+        fire((value) => {
+          tab.setControlValue(item.key, value || "");
+          // Declarative rows re-read their own predicates after a change, but this
+          // one is hand-built, so the dependent username row has to be told.
+          // refreshDomState() does not exist before Obsidian 1.13.0.
+          if (typeof tab.refreshDomState === "function") tab.refreshDomState();
+        })
+      )
+  );
+}
+
+// Every persisted setting, once. Both renderers read this, so the declarative
+// path used by Obsidian 1.13.0+ and the imperative path used by every version
+// before it cannot drift into disagreeing about what settings exist.
+const SETTING_SPEC = [
+  {
+    heading: "Remote",
+    items: [
+      {
+        key: "remoteUrl",
+        name: "Remote URL",
+        desc: "Sync target repository (kept as the git `origin`). Leave empty to keep the existing origin.",
+        type: "text",
+        placeholder: "https://github.com/user/repo.git",
+      },
+      {
+        key: "branch",
+        name: "Branch",
+        desc: "Remote branch to sync.",
+        type: "text",
+        placeholder: "main",
+      },
+      {
+        key: "gitLocation",
+        name: "Git location",
+        desc: "Full path to the git executable. Empty = use git from PATH.",
+        type: "text",
+        placeholder: "C:/Program Files/Git/bin/git.exe",
+      },
+      {
+        key: "proxy",
+        name: "Proxy",
+        desc: "HTTP(S) proxy git uses to reach GitHub. Leave empty for no proxy.",
+        type: "text",
+        placeholder: "http://127.0.0.1:7890",
+      },
+    ],
+  },
+  {
+    heading: "Credentials",
+    items: [
+      {
+        key: "credentialSecretId",
+        name: "Personal access token",
+        desc:
+          "Optional. Leave empty to use this machine's git credentials, which is the default and needs no setup. " +
+          "Selecting a secret makes the plugin authenticate with that token instead -- which is what makes syncing " +
+          "work on a machine that has no credential helper configured, since git cannot show a login prompt from here.",
+        type: "secret",
+      },
+      {
+        key: "credentialUsername",
+        name: "Git username",
+        desc:
+          "Only used alongside a token. GitHub ignores it over HTTPS -- the token is what authenticates -- " +
+          "so the default placeholder is fine unless your host expects a real name.",
+        type: "text",
+        placeholder: "x-access-token",
+        visible: (settings) => !!String(settings.credentialSecretId || "").trim(),
+      },
+    ],
+  },
+  {
+    heading: "How the remote is integrated",
+    items: [
+      {
+        key: "pushMode",
+        name: "Sync mode",
+        desc: "Incremental: normal push only. Auto: force-with-lease only when remote is behind. Force: always force-with-lease.",
+        type: "dropdown",
+        options: PUSH_MODES,
+      },
+      {
+        key: "syncStrategy",
+        name: "How to integrate remote changes",
+        desc:
+          "Used when the remote has commits you don't and you are not force pushing. " +
+          "Merge keeps existing commit hashes and never rewrites anything already on the remote - safest. " +
+          "Rebase keeps history linear, which reads better in a backup repo, and only replays commits you have not pushed yet.",
+        type: "dropdown",
+        options: SYNC_STRATEGIES,
+      },
+      {
+        key: "autoAbortConflicts",
+        name: "Auto-abort sync conflicts",
+        desc:
+          "When the same note changed in both places, Obsidian has no merge UI. With this on, the sync is rolled back to the state it started from and the conflicting notes are listed - your notes keep their content either way. " +
+          "With this off, the merge is left in place so you can resolve it yourself, and syncing stays paused until you do.",
+        type: "toggle",
+      },
+    ],
+  },
+  {
+    heading: "Automatic sync",
+    items: [
+      {
+        key: "autoSyncIntervalMin",
+        name: "Auto sync every N minutes",
+        desc:
+          "Pull and push on a timer while Obsidian is open. 0 turns the timer off. " +
+          "A sync that is still running is never overlapped by the next one.",
+        type: "number",
+        min: 0,
+        placeholder: "5",
+      },
+      {
+        key: "autoSyncOnLoad",
+        name: "Auto sync on load",
+        desc: "Run one full pull + push shortly after Obsidian starts.",
+        type: "toggle",
+      },
+    ],
+  },
+  {
+    heading: "Limits and notices",
+    items: [
+      {
+        key: "maxFileSizeMB",
+        name: "Max file size (MB)",
+        desc:
+          "Files larger than this are skipped (not committed/pushed); the rest of the sync continues. GitHub hard limit is 100 MB.",
+        type: "number",
+        min: 1,
+        placeholder: "100",
+      },
+      { key: "showSuccessNotice", name: "Show success notice", desc: "Show a notice after each successful sync.", type: "toggle" },
+      { key: "enableLogging", name: "Enable logging", desc: "Write sync results to sync.log.", type: "toggle" },
+    ],
+  },
+];
+
 class VaultForceSyncSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
 
+  // Without these, nothing here appears in Obsidian's settings *search* on 1.13.0
+  // and later -- and not implementing them raises no error at all, so the only
+  // symptom is a setting that cannot be found.
+  getSettingDefinitions() {
+    return SETTING_SPEC.map((group) => ({
+      type: "group",
+      heading: group.heading,
+      items: group.items.map((item) => {
+        const def = { name: item.name, desc: item.desc };
+        if (item.visible) def.visible = () => item.visible(this.plugin.settings);
+
+        if (item.type === "secret") {
+          def.render = (setting) => renderSecretRow(this, setting, item);
+        } else {
+          def.control = {
+            type: item.type,
+            key: item.key,
+            defaultValue: DEFAULT_SETTINGS[item.key],
+            placeholder: item.placeholder,
+            min: item.min,
+            options: item.options,
+            validate: makeValidator(item),
+          };
+        }
+        return def;
+      }),
+    }));
+  }
+
+  getControlValue(key) {
+    const settings = this.plugin.settings;
+    return key in settings ? settings[key] : DEFAULT_SETTINGS[key];
+  }
+
+  async setControlValue(key, value) {
+    this.plugin.settings[key] = coerce(key, value);
+    // Changing the interval only takes effect once the timer is rebuilt.
+    if (key === "autoSyncIntervalMin") this.plugin.startTimer();
+    // Awaited rather than fired and forgotten: Obsidian waits on this before it
+    // re-renders, and a rejected write should surface instead of disappearing.
+    await this.plugin.saveSettings();
+  }
+
+  // The pre-1.13 renderer. `display()` is abstract, so it stays; 1.13.0 and later
+  // render from `getSettingDefinitions()` instead. Both read SETTING_SPEC.
   display() {
     const { containerEl } = this;
     containerEl.empty();
 
-    new Setting(containerEl)
-      .setName("Remote URL")
-      .setDesc("Sync target repository (kept as the git `origin`). Leave empty to keep the existing origin.")
-      .addText((text) =>
-        text
-          .setPlaceholder("https://github.com/user/repo.git")
-          .setValue(this.plugin.settings.remoteUrl)
-          .onChange(async (value) => {
-            this.plugin.settings.remoteUrl = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+    for (const group of SETTING_SPEC) {
+      new Setting(containerEl).setName(group.heading).setHeading();
 
-    new Setting(containerEl)
-      .setName("Git location")
-      .setDesc("Full path to the git executable. Empty = use git from PATH.")
-      .addText((text) =>
-        text
-          .setPlaceholder("C:/Program Files/Git/bin/git.exe")
-          .setValue(this.plugin.settings.gitLocation)
-          .onChange(async (value) => {
-            this.plugin.settings.gitLocation = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+      for (const item of group.items) {
+        if (item.visible && !item.visible(this.plugin.settings)) continue;
 
-    new Setting(containerEl)
-      .setName("Proxy")
-      .setDesc("HTTP(S) proxy git uses to reach GitHub. Leave empty for no proxy.")
-      .addText((text) =>
-        text
-          .setPlaceholder("http://127.0.0.1:7890")
-          .setValue(this.plugin.settings.proxy)
-          .onChange(async (value) => {
-            this.plugin.settings.proxy = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+        const setting = new Setting(containerEl).setName(item.name).setDesc(item.desc);
+        const store = (raw) => this.setControlValue(item.key, raw);
 
-    new Setting(containerEl)
-      .setName("Branch")
-      .setDesc("Remote branch to sync.")
-      .addText((text) =>
-        text
-          .setPlaceholder("main")
-          .setValue(this.plugin.settings.branch)
-          .onChange(async (value) => {
-            this.plugin.settings.branch = value.trim() || "main";
-            await this.plugin.saveSettings();
-          })
-      );
+        if (item.type === "secret") {
+          renderSecretRow(this, setting, item);
+          continue;
+        }
 
-    new Setting(containerEl)
-      .setName("Sync mode")
-      .setDesc("Incremental: normal push only. Auto: force-with-lease only when remote is behind. Force: always force-with-lease.")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOptions(PUSH_MODES)
-          .setValue(this.plugin.settings.pushMode)
-          .onChange(async (value) => {
-            this.plugin.settings.pushMode = value;
-            await this.plugin.saveSettings();
-          })
-      );
+        switch (item.type) {
+          case "text":
+            setting.addText((text) =>
+              text
+                .setPlaceholder(item.placeholder || "")
+                .setValue(String(this.plugin.settings[item.key] ?? ""))
+                .onChange(fire((value) => store(value)))
+            );
+            break;
+          case "toggle":
+            setting.addToggle((toggle) =>
+              toggle
+                .setValue(Boolean(this.plugin.settings[item.key]))
+                .onChange(fire((value) => store(value)))
+            );
+            break;
+          case "dropdown":
+            setting.addDropdown((dropdown) => {
+              for (const [value, label] of Object.entries(item.options)) dropdown.addOption(value, label);
+              dropdown
+                .setValue(String(this.plugin.settings[item.key]))
+                .onChange(fire((value) => store(value)));
+            });
+            break;
+          case "number":
+            setting.addText((text) =>
+              text
+                .setPlaceholder(item.placeholder || String(DEFAULT_SETTINGS[item.key]))
+                .setValue(String(this.plugin.settings[item.key]))
+                .onChange(
+                  fire((value) => {
+                    const problem = makeValidator(item)(value);
+                    if (problem) return;
+                    store(value);
+                  })
+                )
+            );
+            break;
+        }
+      }
+    }
 
+    new Setting(containerEl).setName("Logging").setHeading();
     new Setting(containerEl)
-      .setName("Max file size (MB)")
-      .setDesc("Files larger than this are skipped (not committed/pushed); the rest of the sync continues. GitHub hard limit is 100 MB.")
-      .addText((text) =>
-        text
-          .setPlaceholder("100")
-          .setValue(String(this.plugin.settings.maxFileSizeMB))
-          .onChange(async (value) => {
-            const n = parseInt(value, 10);
-            this.plugin.settings.maxFileSizeMB = Number.isFinite(n) && n > 0 ? n : 100;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Auto sync on load")
-      .setDesc("Run one sync shortly after Obsidian starts.")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.autoSyncOnLoad)
-          .onChange(async (value) => {
-            this.plugin.settings.autoSyncOnLoad = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Show success notice")
-      .setDesc("Show a notice after each successful sync.")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.showSuccessNotice)
-          .onChange(async (value) => {
-            this.plugin.settings.showSuccessNotice = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setHeading()
-      .setName("Logging")
-      .setDesc("Every sync run is recorded to a local log file (stays out of git).");
-
-    new Setting(containerEl)
-      .setName("Enable logging")
-      .setDesc("Write sync results to sync.log.")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.enableLogging)
-          .onChange(async (value) => {
-            this.plugin.settings.enableLogging = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("View log")
+      .setName("Log file")
       .setDesc(this.plugin.getLogPath() || "desktop only")
       .addButton((button) =>
-        button
-          .setButtonText("Open sync log")
-          .onClick(() => this.plugin.openLog())
+        button.setButtonText("Open sync log").onClick(() => this.plugin.openLog())
       )
       .addButton((button) =>
-        button
-          .setButtonText("Clear log")
-          .setWarning()
-          .onClick(() => this.plugin.clearLog())
+        button.setButtonText("Clear log").setWarning().onClick(() => this.plugin.clearLog())
       );
   }
 }
