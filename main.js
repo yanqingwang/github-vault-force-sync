@@ -120,6 +120,68 @@ const ASKPASS_WINDOWS = [
   "",
 ].join("\r\n");
 
+// How many force-push backups to keep. Each one pins the commits it points at,
+// so the list has to stay bounded.
+const MAX_FORCE_BACKUPS = 5;
+
+// Markers around the size-skip list inside `.git/info/exclude`. The block is
+// rewritten from scratch on every sync; anything the user wrote around it is
+// left exactly as it was.
+const EXCLUDE_BEGIN = "# vault-force-sync: files over the size limit are skipped (managed)";
+const EXCLUDE_END = "# vault-force-sync: end";
+
+// `.git/info/exclude` is local to the clone and never committed, which is why the
+// size-skip list lives there instead of in `.gitignore`.
+//
+// Splits the file into what came before our block, the block itself, and what
+// came after. An unterminated block (hand-edited) is treated as ours to the end.
+function splitManagedExclude(text) {
+  const before = [];
+  const managed = [];
+  const after = [];
+  let inside = false;
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const t = line.trim();
+    if (t === EXCLUDE_BEGIN) {
+      inside = true;
+      continue;
+    }
+    if (inside) {
+      if (t === EXCLUDE_END) {
+        inside = false;
+        continue;
+      }
+      if (t && !t.startsWith("#")) managed.push(t);
+      continue;
+    }
+    before.push(line);
+  }
+  return { before, managed, after };
+}
+
+// Two directories, tolerating symlinks, trailing separators and (on Windows)
+// case -- so a legitimate vault is never refused as "the wrong repository".
+function samePath(a, b) {
+  const norm = (p) => {
+    let out;
+    try {
+      out = fs.realpathSync(p);
+    } catch (_) {
+      out = path.resolve(p);
+    }
+    out = path.normalize(out).replace(/[\\/]+$/, "");
+    return process.platform === "win32" ? out.toLowerCase() : out;
+  };
+  return norm(a) === norm(b);
+}
+
+// `https://user@host` is a bare username and harmless. `https://user:secret@host`
+// is not: git copies the whole URL into `.git/config` verbatim.
+function looksLikeUrlCredentials(url) {
+  const m = /^[a-z][a-z0-9+.-]*:\/\/([^/@\s]*)@/i.exec(String(url || "").trim());
+  return !!m && m[1].includes(":");
+}
+
 const GITIGNORE_CONTENT = [
   "# Vault Force Sync: exclude dotfiles / hidden files",
   ".*",
@@ -529,13 +591,18 @@ class VaultForceSyncPlugin extends Plugin {
         return;
       }
 
-      this.ensureGitignore(vaultPath);
-
-      const ok = await this.git(vaultPath, ["rev-parse", "--is-inside-work-tree"]);
-      if (ok.code !== 0) {
-        this.report("Not a git repository: " + vaultPath, true);
+      // The vault has to *be* the repository, not merely sit inside one. See
+      // wrongRepoReason() for why that distinction is worth refusing over.
+      //
+      // Checked before anything is written, including .gitignore: refusing has to
+      // leave the directory exactly as it was found.
+      const wrongRepo = await this.wrongRepoReason(vaultPath);
+      if (wrongRepo) {
+        this.report(wrongRepo, true);
         return;
       }
+
+      this.ensureGitignore(vaultPath);
 
       // Keep the sync target (remote URL) pointing at the configured repo.
       await this.ensureRemote(vaultPath);
@@ -664,6 +731,11 @@ class VaultForceSyncPlugin extends Plugin {
         this.report("Could not determine vault path (desktop only).", true);
         return;
       }
+      const wrongRepo = await this.wrongRepoReason(vaultPath);
+      if (wrongRepo) {
+        this.report(wrongRepo, true);
+        return;
+      }
       const busy = await this.integrationInProgress(vaultPath);
       if (busy) {
         this.report(`A ${busy} from a previous sync is still unresolved, so nothing was touched.`, true);
@@ -709,6 +781,13 @@ class VaultForceSyncPlugin extends Plugin {
         this.report("Could not determine vault path (desktop only).", true);
         return;
       }
+      // Read-only, but reporting a foreign repository's branch and drift would be
+      // worse than saying nothing.
+      const wrongRepo = await this.wrongRepoReason(vaultPath);
+      if (wrongRepo) {
+        this.report(wrongRepo, true);
+        return;
+      }
       const branch = this.settings.branch;
       await this.git(vaultPath, ["fetch", "--quiet", "origin", branch]);
 
@@ -744,7 +823,82 @@ class VaultForceSyncPlugin extends Plugin {
     }
   }
 
+  // Returns a refusal message when the vault is not the root of its repository,
+  // or null when the layout is safe.
+  //
+  // This is not pedantry. `rev-parse --is-inside-work-tree` answers true for any
+  // directory nested inside a repository, and `git add -A` run from a
+  // subdirectory stages the *entire* repository -- not the subdirectory. A vault
+  // that merely sits inside another project would therefore have this plugin
+  // commit and push that project: files the user never pointed it at, deletions
+  // among them, published to whatever origin that project happens to have.
+  async wrongRepoReason(vaultPath) {
+    const top = await this.git(vaultPath, ["rev-parse", "--show-toplevel"]);
+    if (top.code !== 0) {
+      return "Not a git repository: " + vaultPath;
+    }
+    const root = top.stdout.trim();
+    if (!root) {
+      return "Could not determine the repository root for: " + vaultPath;
+    }
+    if (samePath(root, vaultPath)) return null;
+
+    return (
+      "Refusing to sync: the vault is not the root of its git repository.\n\n" +
+      "  vault:      " + vaultPath + "\n" +
+      "  repository: " + root + "\n\n" +
+      "This plugin stages and commits the whole repository, so syncing here would " +
+      "publish every file in that project -- including files outside the vault. " +
+      "Give the vault its own repository (`git init` inside it) and sync that instead."
+    );
+  }
+
+  // Snapshots the remote-tracking ref before a force push rewrites it.
+  //
+  // `--force-with-lease` checks that nobody else moved the branch since our fetch;
+  // it does not make the commits we are about to discard recoverable. Without a
+  // ref, they stay only until git next runs gc.
+  async backupRemote(vaultPath) {
+    const branch = this.settings.branch;
+    const from = `refs/remotes/origin/${branch}`;
+    const exists = await this.git(vaultPath, ["rev-parse", "--verify", "--quiet", from]);
+    if (exists.code !== 0) return; // nothing fetched yet, so nothing to lose
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const name = `refs/vault-force-sync/${stamp}`;
+    const res = await this.git(vaultPath, ["update-ref", name, from]);
+    if (res.code !== 0) {
+      // A missing backup in front of a destructive push is the one thing worth
+      // aborting over: the user can still force-push by hand if they mean it.
+      throw new Error(
+        "Refusing to force-push: could not record a backup of " + from + ". " + res.stderr.trim()
+      );
+    }
+    this.log(`force-push backup: ${name} -> ${from}`);
+    await this.pruneBackups(vaultPath);
+  }
+
+  async pruneBackups(vaultPath) {
+    const res = await this.git(vaultPath, [
+      "for-each-ref",
+      // Newest first: the refname is an ISO timestamp, so it sorts chronologically.
+      "--sort=-refname",
+      "--format=%(refname)",
+      "refs/vault-force-sync/",
+    ]);
+    if (res.code !== 0) return;
+    const refs = res.stdout.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+    for (const old of refs.slice(MAX_FORCE_BACKUPS)) {
+      await this.git(vaultPath, ["update-ref", "-d", old]);
+      this.log(`pruned force-push backup ${old}`);
+    }
+  }
+
   async push(vaultPath, args, mode, secs, prefix) {
+    // `--force-with-lease` is the only command here that can drop commits that
+    // exist nowhere else, so it is the only one that needs a safety net.
+    if (args.includes("--force-with-lease")) await this.backupRemote(vaultPath);
+
     const res = await this.git(vaultPath, args);
     if (res.code !== 0) {
       let msg = `Push (${mode}) failed: ${res.stderr.trim()}`;
@@ -777,6 +931,20 @@ class VaultForceSyncPlugin extends Plugin {
   async ensureRemote(vaultPath) {
     const url = (this.settings.remoteUrl || "").trim();
     if (!url) return;
+
+    // A token pasted into the URL is the one way a credential still reaches disk:
+    // git copies the remote URL into `.git/config` verbatim. Everything else this
+    // plugin does keeps the token out of there, so saying so is worth one notice.
+    // Once per session, not once per sync.
+    if (looksLikeUrlCredentials(url) && !this.warnedUrlCredentials) {
+      this.warnedUrlCredentials = true;
+      this.notify(
+        "Remote URL contains credentials, which git stores in .git/config as plain text. " +
+          "Settings -> Credentials keeps the token in Obsidian's SecretStorage instead.",
+        true
+      );
+      this.log("warning: remote URL embeds credentials");
+    }
     const existing = await this.git(vaultPath, ["remote", "get-url", "origin"]);
     if (existing.code === 0) {
       const cur = existing.stdout.trim();
@@ -797,42 +965,72 @@ class VaultForceSyncPlugin extends Plugin {
     const maxMB = Math.max(1, parseInt(this.settings.maxFileSizeMB, 10) || 100);
     const limit = maxMB * 1024 * 1024;
 
-    const others = await this.git(vaultPath, ["ls-files", "--others", "--exclude-standard"]);
-    const modified = await this.git(vaultPath, ["ls-files", "-m"]);
-    const candidates = (others.stdout + "\n" + modified.stdout)
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-
     const excludeFile = path.join(vaultPath, ".git", "info", "exclude");
     let existing = "";
     try {
       existing = fs.readFileSync(excludeFile, "utf8");
     } catch (_) {}
-    const already = new Set(existing.split(/\r?\n/).map((l) => l.trim()));
+    const { before, managed, after } = splitManagedExclude(existing);
 
-    const toAdd = [];
-    for (const rel of candidates) {
-      const abs = path.join(vaultPath, rel);
-      let size = 0;
+    const sizeOf = (abs) => {
       try {
-        size = fs.statSync(abs).size;
+        return fs.statSync(abs).size;
       } catch (_) {
-        continue; // file vanished or unreadable
+        return 0; // gone or unreadable
       }
+    };
+
+    // Previously skipped files are re-checked rather than trusted. A pattern has
+    // to be released the moment it stops being true: raise the size limit, shrink
+    // the file, or delete it, and an append-only list would keep that file out of
+    // the repository forever, with nothing on screen to explain why it never
+    // appears on the other device.
+    const keep = new Set();
+    for (const pat of managed) {
+      if (sizeOf(path.join(vaultPath, pat.replace(/^\/+/, ""))) > limit) keep.add(pat);
+    }
+    const keptCount = keep.size;
+
+    const others = await this.git(vaultPath, ["ls-files", "--others", "--exclude-standard"]);
+    const modified = await this.git(vaultPath, ["ls-files", "-m"]);
+    const candidates = (others.stdout + "\n" + modified.stdout)
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+
+    for (const rel of candidates) {
+      const size = sizeOf(path.join(vaultPath, rel));
       if (size <= limit) continue;
       const pat = "/" + rel.replace(/\\/g, "/");
-      if (already.has(pat)) continue;
-      toAdd.push(pat);
-      await this.git(vaultPath, ["reset", "--quiet", "--", rel]); // unstage if a prior run staged it
+      if (keep.has(pat)) continue;
+      keep.add(pat);
+      // `.git/info/exclude` only governs untracked files, so a tracked file that
+      // is over the limit still has to be unstaged explicitly, every sync.
+      await this.git(vaultPath, ["reset", "--quiet", "--", rel]);
       this.log(`skipped >${maxMB}MB file: ${rel} (${(size / 1048576).toFixed(1)}MB)`);
     }
 
-    if (toAdd.length) {
-      const content =
-        (existing ? existing.replace(/\s+$/, "\n") : "") + toAdd.join("\n") + "\n";
-      fs.writeFileSync(excludeFile, content, "utf8");
-      this.notify(`Skipped ${toAdd.length} large file(s) (>${maxMB}MB) — syncing the rest.`, true);
+    const parts = [];
+    const head = before.join("\n").replace(/\s+$/, "");
+    if (head) parts.push(head);
+    if (keep.size) parts.push([EXCLUDE_BEGIN].concat([...keep].sort()).concat(EXCLUDE_END).join("\n"));
+    const tail = after.join("\n").replace(/^\s+/, "").replace(/\s+$/, "");
+    if (tail) parts.push(tail);
+    const next = parts.length ? parts.join("\n\n") + "\n" : "";
+
+    if (next === existing) return;
+    try {
+      fs.mkdirSync(path.dirname(excludeFile), { recursive: true });
+      fs.writeFileSync(excludeFile, next, "utf8");
+    } catch (err) {
+      this.notify("Could not update .git/info/exclude: " + err.message, true);
+      return;
+    }
+
+    const added = keep.size - keptCount;
+    if (added > 0) this.notify(`Skipped ${added} large file(s) (>${maxMB}MB) - syncing the rest.`, true);
+    if (keep.size < managed.length) {
+      this.log(`released ${managed.length - keep.size} size-skip pattern(s)`);
     }
   }
 
