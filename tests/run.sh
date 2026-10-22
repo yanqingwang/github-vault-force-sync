@@ -17,7 +17,7 @@ command -v git  >/dev/null 2>&1 || { echo "git is required but was not found on 
 # silently conflicts, a push that runs before the pull) is invisible to a stubbed
 # git, so the tests create actual repositories and a bare remote.
 fail=0
-for f in sync settings credentials safety; do
+for f in sync settings credentials safety scope; do
   printf '%-14s' "$f"
   if out=$(node "$f.test.js" 2>&1); then
     printf '%s\n' "$(printf '%s' "$out" | tail -1)"

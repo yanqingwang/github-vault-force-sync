@@ -5,6 +5,49 @@
   word-break: break-all;
 }
 
+.vault-force-sync-folder-list-setting {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.vault-force-sync-folder-list-setting .setting-item-info {
+  margin-bottom: 0.5em;
+}
+
+.vault-force-sync-folder-list-setting .setting-item-control {
+  justify-content: flex-start;
+}
+
+.vault-force-sync-folder-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+  width: 100%;
+}
+
+.vault-force-sync-folder-row,
+.vault-force-sync-folder-add {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+
+.vault-force-sync-folder-add {
+  flex-wrap: wrap;
+  margin-top: 0.25em;
+}
+
+.vault-force-sync-folder-name {
+  flex: 1;
+  font-family: var(--font-monospace);
+  word-break: break-all;
+}
+
+.vault-force-sync-folder-input {
+  flex: 1;
+  min-width: 12em;
+}
+
 .vault-force-sync-log .vault-force-sync-log-pre {
   max-height: 60vh;
   overflow: auto;

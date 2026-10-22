@@ -102,6 +102,12 @@ const DEFAULTS = {
   showSuccessNotice: true,
   enableLogging: true,
   maxFileSizeMB: 100,
+  excludedFolders: [],
+  syncOnlyFolders: [],
+  excludeHiddenFiles: true,
+  excludeDotFolders: true,
+  excludeUnderscoreFiles: false,
+  excludeUnderscoreFolders: false,
 };
 
 // Run the plugin's real onload so the tab under test is the one it actually
@@ -135,6 +141,10 @@ const KEYS = [
   "maxFileSizeMB",
   "showSuccessNotice",
   "enableLogging",
+  "excludeHiddenFiles",
+  "excludeDotFolders",
+  "excludeUnderscoreFiles",
+  "excludeUnderscoreFolders",
 ];
 
 // --- declarative definitions -------------------------------------------------
@@ -174,6 +184,17 @@ check("dropdowns declare their options", async () => {
   assert(mode.control.options.incremental, "pushMode lost its options");
   const strat = items.find((i) => i.control && i.control.key === "syncStrategy");
   assert(strat.control.options.merge && strat.control.options.rebase, "syncStrategy lost its options");
+});
+
+check("folder lists are rendered rows, not single-value controls", async () => {
+  const { tab } = await boot();
+  const items = tab.getSettingDefinitions().flatMap((g) => g.items);
+  for (const name of ["Excluded folders", "Sync only these folders"]) {
+    const row = items.find((i) => i.name === name);
+    assert(row, `missing row: ${name}`);
+    assert(typeof row.render === "function", `${name} has no renderer`);
+    assert(row.control === undefined, `${name} should not be a control`);
+  }
 });
 
 // --- read / write ------------------------------------------------------------
@@ -221,6 +242,32 @@ check("maxFileSizeMB refuses zero, which would skip every file", async () => {
   assert(tab.plugin.settings.maxFileSizeMB === 100, `got ${tab.plugin.settings.maxFileSizeMB}`);
   await tab.setControlValue("maxFileSizeMB", 250);
   assert(tab.plugin.settings.maxFileSizeMB === 250, "a valid size was rejected");
+});
+
+check("folder paths are normalized, de-duplicated, and root is refused", async () => {
+  const { tab } = await boot();
+  assert(await tab.addFolder("excludedFolders", "  Notes\\Archive/  "), "a valid folder was refused");
+  assert(
+    JSON.stringify(tab.plugin.settings.excludedFolders) === JSON.stringify(["Notes/Archive"]),
+    `not normalized: ${JSON.stringify(tab.plugin.settings.excludedFolders)}`
+  );
+  assert(!(await tab.addFolder("excludedFolders", "Notes/Archive")), "a duplicate was accepted");
+  for (const bad of ["", ".", "/", "Notes/../Secret", "./"]) {
+    assert(!(await tab.addFolder("excludedFolders", bad)), `the root/escaping path "${bad}" was accepted`);
+  }
+  assert(
+    tab.plugin.settings.excludedFolders.length === 1,
+    "a rejected path changed the stored list"
+  );
+
+  await tab.setControlValue("syncOnlyFolders", [" Notes/ ", "Notes", "Other"]);
+  assert(
+    JSON.stringify(tab.plugin.settings.syncOnlyFolders) === JSON.stringify(["Notes", "Other"]),
+    `list values were not normalized: ${JSON.stringify(tab.plugin.settings.syncOnlyFolders)}`
+  );
+
+  await tab.removeFolder("excludedFolders", "Notes/Archive");
+  assert(tab.plugin.settings.excludedFolders.length === 0, "remove did not persist");
 });
 
 check("validation rejects what coerce would silently fix", async () => {

@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-An [Obsidian](https://obsidian.md) plugin that keeps your entire vault in sync with a GitHub repository using the system `git`. It works **in both directions** — it pulls what changed on another device and pushes what changed on this one — moves only the delta since the last sync, can force-push when you need it, automatically skips files larger than 100 MB so a sync never gets stuck, and keeps a local log you can view anytime.
+An [Obsidian](https://obsidian.md) plugin that keeps your entire vault — or only the folders you choose — in sync with a GitHub repository using the system `git`. It works **in both directions** — it pulls what changed on another device and pushes what changed on this one — moves only the delta since the last sync, can force-push when you need it, automatically skips files larger than 100 MB so a sync never gets stuck, and keeps a local log you can view anytime.
 
 Your notes are the one thing here that cannot be regenerated, so the design is built around never being the reason you lose them. Everything below is arranged under that constraint — see [what the plugin guarantees](#what-the-plugin-guarantees).
 
@@ -35,6 +35,9 @@ No `reset --hard`, no `git clean`, no `git stash`, no `checkout`. The only write
 **A size-skip cannot outlive its reason.**
 Files over the limit are listed in `.git/info/exclude` so they do not slow every sync. That list is **rewritten** on each run rather than appended to: raise the limit, shrink the file, or delete it, and the pattern is released. An append-only list would keep that file out of the repository forever, with nothing on screen explaining why it never reached the other device.
 
+**Excluding a folder never deletes what is already tracked there.**
+A file that was already tracked when its folder became excluded stays in the repository; the plugin stops staging its edits and resets a local deletion too. A move into that folder is kept as a move when git can pair the two sides — a rename, or a same-name add — so the old remote copy stays. Removing an excluded folder from the remote has to be an explicit `git rm -r --cached` plus a push.
+
 **A token does not end up on disk.**
 It lives in Obsidian's SecretStorage, reaches git through an environment variable, and is never written into `.git/config`, the remote URL, or the repository. A remote URL that *does* embed credentials is flagged, because git stores that URL in `.git/config` verbatim.
 
@@ -54,20 +57,50 @@ It lives in Obsidian's SecretStorage, reaches git through an environment variabl
   | Force | Always `git push --force-with-lease`. Discards the remote by request. |
 - **Large-file guard** — files over the configured size limit (default 100 MB, GitHub's hard limit) are skipped via `.git/info/exclude` so the rest of the sync continues. That list is rewritten each run, so raising the limit brings the file back.
 - **Force pushes are recoverable** — the remote's state is snapshotted to a local ref before a force push, so hitting Force by mistake is undoable.
-- **Dotfiles stay local** — writes a `.gitignore` (`.*` + `!/.gitignore`) so `.obsidian` and other hidden files/folders are never tracked.
+- **Sync scope controls** — exclude specific folders, sync only selected folders, and independently control dot-prefixed (hidden) files/folders and underscore-prefixed files/folders. Folder entries match at a folder boundary, so `Archive` never captures `Archive-old`. `.git`, `.trash`, and the plugin's own folder are always excluded.
+- **No generated `.gitignore`** — the old `.*` rule is migrated away automatically, so turning dotfile sync back on actually works. Scope is applied to the staged file list instead, which lets a move into an excluded folder be paired as a move rather than a deletion.
 - **Works without a credential helper** — if the machine has no `gh`/Keychain/Credential Manager set up, select a personal access token (stored in Obsidian's SecretStorage, never in the vault) and the plugin authenticates with that instead.
 - **Sync log** — every run is recorded to `sync.log` (local only, never committed), viewable from the command palette or Settings.
 - **Optional proxy** — configure an HTTP(S) proxy for git if your network needs one to reach GitHub.
+
+## Sync scope
+
+The scope controls mirror the Nextcloud sync plugin's folder and name filters, adapted to a git-backed vault:
+
+| Control | What it does |
+|---------|--------------|
+| **Excluded folders** | Folders that are never staged or pushed. Matched by vault-relative folder prefix at a boundary: `Archive` covers `Archive/**` but not `Archive-old` or `notes/Archive`. |
+| **Sync only these folders** | Empty = the whole vault. When set, only files under those folders are staged (plus the root `.gitignore` control file); everything else stays local. Excluded folders and the name filters still win. |
+| **Exclude dot-prefixed (hidden) files** | Files whose basename starts with `.` — `.env`, `.DS_Store`. This is the hidden-file rule on macOS/Linux; Windows hidden attributes are not inspected. On by default. |
+| **Exclude dot-prefixed (hidden) folders** | Folders whose name starts with `.` and everything inside — `.obsidian`, `.archive`. `.git` and `.trash` stay excluded even when this is off. On by default. |
+| **Exclude underscore-prefixed files** | Files whose basename starts with `_` — `_draft.md`, `_template.canvas`. Off by default. |
+| **Exclude underscore-prefixed folders** | Folders whose name starts with `_` and everything inside. Off by default. |
+
+The four name toggles are independent. Turning off the dotfile rule syncs `.env` without syncing `.obsidian`; turning off the dotfolder rule syncs `.obsidian/config.json` without syncing `.env`.
+
+The root `.gitignore` is treated as a repository control file and stays syncable in every mode. Nested `.gitignore` files follow the normal hidden-file rule. Only the block this plugin generated is migrated automatically; a `.*` rule you wrote yourself still hides dotfiles from git, so remove that line by hand if you want the toggle to take effect.
+
+### What scope does and does not do
+
+Scope controls decide what **this device stages and pushes**. They are not a history rewrite and not a download filter:
+
+- Files that were already tracked when you exclude their folder stay in the repository. Local edits to them stop being pushed, but they are not deleted from the remote automatically. To remove them on purpose: `git rm -r --cached -- <folder>`, then let the plugin commit and push the deletion.
+- Those unstaged edits still make the working tree dirty. If a later pull needs to touch the same file, git can refuse the merge or rebase; the plugin reports that and never discards your edit. Commit it, revert it, or remove the file from the repository to unblock the pull.
+- Files already on the remote are still pulled if they are in the branch history. Git merges history, not a filtered view of it. A folder excluded on this device is not erased from another device's clone.
+- Moving a tracked file **into** an excluded folder is kept as a move when git can pair the two sides (a rename, or a same-name add). The old remote copy stays and the local move stays local. Moving a tracked file **out of** an excluded folder stages the new copy while the old excluded copy remains in the repository.
+- In a sync-only selection, a move out is paired by basename; a move that changes both the folder and the name can look like a plain deletion.
+- Obsidian's `.trash` is the exception: moving a note there *is* a deletion, so the tracked path is deleted on the remote. The trash copy itself is never committed.
+- Excluded files are still visible to `git add` before the post-stage filter removes them. This is deliberate: hiding the destination in `.git/info/exclude` would make a move look like a deletion. Large untracked files are still handled by the size guard before staging.
 
 ## How one sync runs
 
 The order is deliberate:
 
 ```
-stage (git add -A) → commit → fetch → integrate remote → push
+stage (git add -A, or the selected folders) → remove out-of-scope paths → commit → fetch → integrate remote → push
 ```
 
-**Commit before integrating.** `git rebase` refuses to run with unstaged changes, and a merge would otherwise have to resolve the commit we just made against the remote. Staging first means the tree is clean before we integrate, and your local change is merged as one unit.
+**Commit before integrating.** `git rebase` refuses to run with unstaged changes, and a merge would otherwise have to resolve the commit we just made against the remote. Staging first means the in-scope tree is clean before we integrate, and your local change is merged as one unit. Out-of-scope edits are left untouched; if one of them blocks the integration, the plugin reports it rather than discarding it.
 
 **Integrate before pushing.** Whatever the remote gained is folded into your branch first, so your commits are pushed *on top of* remote history rather than against it.
 
@@ -143,7 +176,7 @@ Add `yanqingwang/github-vault-force-sync` as a beta plugin in [BRAT](https://git
 
 1. Enable the plugin, then open **Settings → Vault Force Sync**.
 2. Set the **Remote URL** to your GitHub repository (e.g. `https://github.com/user/vault-backup.git`). Leave it empty to keep an existing `origin`.
-3. Optionally set **Git location** (full path to the git binary), **Proxy**, **Branch**, and **Max file size**.
+3. Optionally set **Git location** (full path to the git binary), **Proxy**, **Branch**, and **Max file size**. Under **Sync scope**, add excluded folders, choose a sync-only whitelist, or adjust the dot/underscore name toggles.
 4. Turn on **Auto sync every N minutes** if you want it to run without you.
 5. Click the refresh icon in the ribbon, or run one of the commands:
 
@@ -157,12 +190,12 @@ Add `yanqingwang/github-vault-force-sync` as a beta plugin in [BRAT](https://git
 
 ## What the plugin writes to your system
 
-- `<vault>/.gitignore` — only if missing (`.*` / `!/.gitignore`).
-- `<vault>/.git/info/exclude` — oversized files go in a marked, managed block so they do not slow every sync. The block is rewritten each run and released as soon as it stops applying; **anything you wrote in that file yourself is left untouched.** Never committed.
+- `<vault>/.gitignore` — **no longer created.** If an older version left the generated `.*` / `!/.gitignore` block, it is removed once and replaced with a short comment. Custom lines around it are preserved. The root `.gitignore` remains a normal repository control file.
+- `<vault>/.git/info/exclude` — oversized files go in a marked, managed block so they do not slow every sync. The block is rewritten each run and released as soon as it stops applying; **anything you wrote in that file yourself is left untouched.** Sync-scope rules are deliberately *not* written here. Never committed.
 - `refs/vault-force-sync/<timestamp>` in your local repository — a snapshot of the remote taken before a force push. Local only, never pushed; the last 5 are kept.
 - Repo-local git config: `http.postBuffer`, and `http.proxy` / `https.proxy` **only if** you configured a proxy.
 - `<config-dir>/plugins/vault-force-sync/sync.log` — the sync log.
-- `<config-dir>/plugins/vault-force-sync/.askpass.sh` (or `.askpass.cmd` on Windows) — **only when a token is configured**. It reads the token from the environment rather than containing it, so no secret is written to disk. It is a dotfile so the plugin's `.*` gitignore rule keeps it untracked whatever your config folder is called, and it is safe to delete — it is rewritten on the next sync.
+- `<config-dir>/plugins/vault-force-sync/.askpass.sh` (or `.askpass.cmd` on Windows) — **only when a token is configured**. It reads the token from the environment rather than containing it, so no secret is written to disk. The plugin's own folder is a hard exclusion, so the helper stays untracked whatever your config folder is called, and it is safe to delete — it is rewritten on the next sync.
 
 The config directory is `Vault#configDir`, which is `.obsidian` unless you renamed it. The plugin never assumes that name.
 
@@ -172,10 +205,10 @@ The plugin never rewrites your notes' content except by pulling remote changes a
 
 The guarantees above are the load-bearing ones. These are the operational details around them.
 
-- **Everything not ignored is committed and pushed.** The plugin stages with `git add -A`, so any file in the vault that is not covered by `.gitignore` or `.git/info/exclude` goes into the commit and reaches the remote. Keep secrets out of the vault, or ignore them — a token in a note is a token on GitHub.
+- **Everything not filtered is committed and pushed.** The plugin stages with `git add -A` (or the selected folders), then removes paths rejected by the scope filter. Any file that survives that filter and is not covered by `.gitignore` or `.git/info/exclude` goes into the commit and reaches the remote. Keep secrets out of the vault, or ignore them — a token in a note is a token on GitHub.
 - Two syncs never overlap: a trigger that arrives mid-run is dropped, not queued. Without this a timer and a manual click could race on the same index.
 - Files larger than the limit are reported in a notice and skipped; everything else syncs normally.
-- The plugin never touches the config folder, so per-device settings (including this plugin's own) are not synced.
+- The plugin's own folder is always excluded, but the rest of the config folder is controlled by the dotfolder toggle. With dotfolders off, `.obsidian` can sync; per-device settings may then conflict between machines. Leave dotfolders on unless you mean to sync config.
 - A public remote makes the whole vault public. If you are syncing somewhere anyone can read, check what is in there first.
 
 ## Settings reference
@@ -193,6 +226,12 @@ The guarantees above are the load-bearing ones. These are the operational detail
 | Auto-abort sync conflicts | on | Roll a conflicted sync back and report it, instead of leaving a merge in place. |
 | Auto sync every N minutes | `5` | Pull + push on a timer. `0` = off. |
 | Auto sync on load | off | Run one full sync shortly after Obsidian starts. |
+| Excluded folders | *(empty)* | Never staged or pushed. Folder-boundary matching, vault-relative. `.git`, `.trash`, and the plugin's own folder are always excluded. |
+| Sync only these folders | *(empty)* | Empty = whole vault. Otherwise only files under these folders are staged. Exclusions and name filters still win. |
+| Exclude dot-prefixed (hidden) files | on | Files whose basename starts with `.`. On macOS/Linux this is the hidden-file rule; Windows hidden attributes are not inspected. |
+| Exclude dot-prefixed (hidden) folders | on | Folders whose name starts with `.` and everything inside. `.git` and `.trash` remain excluded when off. |
+| Exclude underscore-prefixed files | off | Files whose basename starts with `_`. |
+| Exclude underscore-prefixed folders | off | Folders whose name starts with `_` and everything inside. |
 | Max file size (MB) | `100` | Larger files are skipped. GitHub hard limit is 100 MB. |
 | Show success notice | on | Notice after each successful sync. |
 | Enable logging | on | Write sync results to `sync.log`. |
@@ -205,7 +244,7 @@ There is no build step — `main.js` is the source, plain CommonJS, loaded direc
 
 ```bash
 node --check main.js   # syntax
-sh tests/run.sh        # the whole suite, 57 checks
+sh tests/run.sh        # the whole suite, 78 checks
 ```
 
 `tests/run.sh` needs nothing installed beyond Node and `git`:
@@ -213,9 +252,10 @@ sh tests/run.sh        # the whole suite, 57 checks
 | File | Covers | Checks |
 |------|--------|--------|
 | `tests/sync.test.js` | Two devices sharing one bare remote: local-only change, remote-only change (fast-forward), clean divergence, conflict rollback, rebase, force, an unresolved merge blocking the next run, re-entrancy | 8 |
-| `tests/settings.test.js` | Declarative definitions and search index, read/write, validation, timer lifecycle, log-path resolution | 17 |
+| `tests/settings.test.js` | Declarative definitions and search index, read/write, folder-list normalization, validation, timer lifecycle, log-path resolution | 19 |
 | `tests/credentials.test.js` | Credential resolution, missing/empty SecretStorage, the generated helper holding no token, git's own credential lookup, `configDir` shapes | 17 |
 | `tests/safety.test.js` | Refusal when the vault is not its repository root (and that the project is left untouched), force-push backups and recovery, backup pruning, credentials in a remote URL, size-skip patterns being released, user lines in `.git/info/exclude` surviving | 15 |
+| `tests/scope.test.js` | Folder-boundary matching, excluded folders, sync-only lists, independent dotfile/dotfolder and underscore file/folder toggles, legacy `.gitignore` migration, tracked-file and rename behavior | 19 |
 
 These are not unit tests over a mocked git. A merge that silently conflicts, or a push that runs before the pull, is invisible to a stub — so every scenario creates real repositories, a real bare remote, and drives the real binary. The credential tests run `git credential fill` and assert on what git actually hands back. The safety tests build the exact nested-vault layout that makes the repository-root check necessary, and then assert the parent project was left byte-for-byte untouched.
 

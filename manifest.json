@@ -1,9 +1,9 @@
 {
   "id": "vault-force-sync",
   "name": "Vault Force Sync",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "minAppVersion": "0.15.0",
-  "description": "Two-way sync between your vault and a GitHub remote: pulls remote changes and pushes local ones, on demand or on a timer. Integrates the remote with merge or rebase instead of forcing, skips >100MB files, and rolls back cleanly on conflict.",
+  "description": "Two-way sync between your vault and a GitHub remote: pulls remote changes and pushes local ones, on demand or on a timer. Exclude folders, sync only selected folders, and control dot/hidden/underscore paths. Integrates with merge or rebase, skips >100MB files, and rolls back cleanly on conflict.",
   "author": "yanqingwang",
   "isDesktopOnly": true
 }

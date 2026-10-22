@@ -3,18 +3,22 @@
 // Desktop only. Uses the system `git` (must be on PATH).
 // Conventions:
 //   - runs inside the vault repo (the vault itself is the git work tree)
-//   - writes `.gitignore` (.* / !/.gitignore) so dotfiles never get tracked
+//   - sync-scope filters (folders, dot/hidden names, underscore names) are
+//     applied by resetting rejected paths after staging, so no generated
+//     `.gitignore` is required and moves are still visible as renames
 //   - optionally configures an HTTP(S) proxy + large http.postBuffer for big pushes
 //   - one sync is: stage -> commit -> fetch -> integrate remote -> push. Only
 //     the delta since the last sync moves, in both directions.
 //   - logs every sync run to `<vault>/.obsidian/plugins/vault-force-sync/sync.log`
-//     (local only — `.obsidian` is gitignored), viewable via the "Open sync log"
-//     command or the button in settings.
+//     (local only — the plugin's own folder is always excluded from staging),
+//     viewable via the "Open sync log" command or the button in settings.
 //
 // Why commit *before* integrating: `git rebase` refuses to run with unstaged
 // changes, and a merge would otherwise have to resolve our own brand-new commit
-// against the remote. Staging first means the tree is clean by the time we
-// integrate, and the local change is rebased/merged as a whole unit.
+// against the remote. Staging first means the in-scope tree is clean by the time
+// we integrate, and the local change is rebased/merged as a whole unit. Edits in
+// already-tracked paths that the scope filter rejects deliberately stay out of
+// the commit; if they make a pull refuse, that is reported rather than discarded.
 //
 // Push modes:
 //   incremental : normal `git push` only; never overwrite remote. Divergence is
@@ -88,6 +92,20 @@ const DEFAULT_SETTINGS = {
   showSuccessNotice: true,
   enableLogging: true,
   maxFileSizeMB: 100,
+  // Sync scope. These mirror the Nextcloud-style controls: folder lists are
+  // vault-relative, matched at folder boundaries, and the name filters are
+  // independent of each other.
+  excludedFolders: [],
+  syncOnlyFolders: [],
+  // Dot-prefixed names are the "hidden" names on macOS/Linux, and Obsidian's
+  // own config folder is a dotfolder. Defaults preserve the plugin's historical
+  // behaviour: all dot content stays local.
+  excludeHiddenFiles: true,
+  excludeDotFolders: true,
+  // Underscore-prefixed names are frequently real notes (templates, drafts), so
+  // these are opt-in.
+  excludeUnderscoreFiles: false,
+  excludeUnderscoreFolders: false,
 };
 
 // Git calls an askpass program with the prompt as its only argument and reads the
@@ -182,11 +200,181 @@ function looksLikeUrlCredentials(url) {
   return !!m && m[1].includes(":");
 }
 
-const GITIGNORE_CONTENT = [
-  "# Vault Force Sync: exclude dotfiles / hidden files",
+// Older versions generated this file to hide every dot path. The same job is
+// now done by the configurable scope filter below, so the legacy block is
+// removed instead of being allowed to override the user's toggles.
+const LEGACY_GITIGNORE_HEADER = "# Vault Force Sync: exclude dotfiles / hidden files";
+const LEGACY_GITIGNORE_CONTENT = [
+  LEGACY_GITIGNORE_HEADER,
   ".*",
   "!/.gitignore",
 ].join("\n") + "\n";
+const MIGRATED_GITIGNORE_CONTENT = [
+  "# Vault Force Sync: sync-scope filters live in the plugin settings.",
+  "# They are applied to the staged file list, not to this file.",
+].join("\n") + "\n";
+
+// Always excluded, whatever the name-filter toggles say: a repository cannot
+// safely sync its own metadata, and Obsidian's trash is device-local.
+const HARD_EXCLUDED_FOLDERS = [".git", ".trash"];
+
+// Vault-relative folder path, "/"-separated. Returns null for the vault root and
+// for anything that would escape it. No glob/wildcard syntax: this is a folder
+// prefix, not a pattern language.
+function normalizeFolderPath(input) {
+  if (typeof input !== "string") return null;
+  let p = input.trim();
+  if (!p || /[\0\r\n]/.test(p)) return null;
+  p = p.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+  p = p.replace(/^\.\/+/, "").replace(/^\/+/, "").replace(/\/+$/, "");
+  const parts = p.split("/").filter(Boolean);
+  if (!parts.length) return null;
+  if (parts.some((seg) => seg === "." || seg === "..")) return null;
+  return parts.join("/");
+}
+
+// Stored folder lists are normalized and de-duplicated at every boundary, so a
+// hand-edited data.json cannot put the sync into a state the UI cannot repair.
+function normalizeFolderList(value) {
+  const raw = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[\n,]/)
+      : [];
+  const out = [];
+  const seen = new Set();
+  for (const entry of raw) {
+    const folder = normalizeFolderPath(entry);
+    if (!folder || seen.has(folder)) continue;
+    seen.add(folder);
+    out.push(folder);
+  }
+  return out;
+}
+
+// Folder-boundary prefix match: "Archive" covers "Archive" and "Archive/x",
+// never "Archive-old". Case-sensitive, like Obsidian's logical paths.
+function isUnderFolder(relPath, folders) {
+  if (!Array.isArray(folders) || folders.length === 0) return false;
+  const p = String(relPath || "").replace(/\\/g, "/");
+  for (const folder of folders) {
+    if (!folder) continue;
+    if (p === folder || p.startsWith(folder + "/")) return true;
+  }
+  return false;
+}
+
+function baseName(relPath) {
+  const parts = String(relPath || "").replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
+// Obsidian's trash is where a deletion goes, not an archive folder. A move into
+// it must publish the deletion of the tracked source, unlike a move into a
+// user-excluded folder, whose remote copy is deliberately kept.
+function isTrashPath(relPath) {
+  return isUnderFolder(relPath, [".trash"]);
+}
+
+// Folder segments only. A root-level dotfile is judged by the hidden-file rule,
+// not by the dotfolder rule, so the two controls stay independent.
+function folderSegments(relPath) {
+  const parts = String(relPath || "").replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts.slice(0, -1);
+}
+
+function isUnderDotFolder(relPath) {
+  return folderSegments(relPath).some((seg) => seg.startsWith("."));
+}
+
+function isUnderUnderscoreFolder(relPath) {
+  return folderSegments(relPath).some((seg) => seg.startsWith("_"));
+}
+
+function readSyncFilters(settings) {
+  const s = settings || {};
+  return {
+    excludedFolders: normalizeFolderList(s.excludedFolders),
+    syncOnlyFolders: normalizeFolderList(s.syncOnlyFolders),
+    excludeHiddenFiles:
+      s.excludeHiddenFiles === undefined
+        ? DEFAULT_SETTINGS.excludeHiddenFiles
+        : Boolean(s.excludeHiddenFiles),
+    excludeDotFolders:
+      s.excludeDotFolders === undefined
+        ? DEFAULT_SETTINGS.excludeDotFolders
+        : Boolean(s.excludeDotFolders),
+    excludeUnderscoreFiles:
+      s.excludeUnderscoreFiles === undefined
+        ? DEFAULT_SETTINGS.excludeUnderscoreFiles
+        : Boolean(s.excludeUnderscoreFiles),
+    excludeUnderscoreFolders:
+      s.excludeUnderscoreFolders === undefined
+        ? DEFAULT_SETTINGS.excludeUnderscoreFolders
+        : Boolean(s.excludeUnderscoreFolders),
+  };
+}
+
+// The one decision every staging path goes through. Precedence mirrors the
+// Nextcloud plugin: hard exclusions, user exclusions, name filters, then the
+// sync-only whitelist. A whitelisted folder can never rescue an excluded one.
+function shouldSkipPath(relPath, filters, extraHardFolders) {
+  const p = String(relPath || "").replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!p) return false;
+  // The repository's own control file is useful on every clone, and older
+  // versions tracked it. Keep it out of the hidden-file rule so migrating away
+  // from the generated `.*` block can actually be committed.
+  if (p === ".gitignore") return false;
+
+  const hard = HARD_EXCLUDED_FOLDERS.concat(extraHardFolders || []);
+  if (isUnderFolder(p, hard)) return true;
+  if (isUnderFolder(p, filters.excludedFolders)) return true;
+  if (filters.excludeHiddenFiles && baseName(p).startsWith(".")) return true;
+  if (filters.excludeDotFolders && isUnderDotFolder(p)) return true;
+  if (filters.excludeUnderscoreFiles && baseName(p).startsWith("_")) return true;
+  if (filters.excludeUnderscoreFolders && isUnderUnderscoreFolder(p)) return true;
+  if (filters.syncOnlyFolders.length > 0 && !isUnderFolder(p, filters.syncOnlyFolders)) return true;
+  return false;
+}
+
+// Removes the `.gitignore` block that older versions generated. Custom lines
+// around it are preserved; if the file held nothing but that block, a short
+// explanatory comment takes its place.
+function removeLegacyGitignoreBlock(text) {
+  const src = String(text || "");
+  if (src === LEGACY_GITIGNORE_CONTENT) return MIGRATED_GITIGNORE_CONTENT;
+
+  const lines = src.split(/\r?\n/);
+  const out = [];
+  let removed = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() !== LEGACY_GITIGNORE_HEADER) {
+      out.push(lines[i]);
+      continue;
+    }
+    removed = true;
+    let j = i + 1;
+    // Tolerate blank lines around the two generated rules, and remove only the
+    // exact rules the old version wrote.
+    while (j < lines.length && !lines[j].trim()) j++;
+    if (j < lines.length && lines[j].trim() === ".*") {
+      j++;
+      while (j < lines.length && !lines[j].trim()) j++;
+      if (j < lines.length && lines[j].trim() === "!/.gitignore") j++;
+    }
+    i = j - 1;
+  }
+  if (!removed) return src;
+
+  const next = out.join("\n").replace(/^\n+/, "").replace(/\n+$/, "");
+  return next ? next + "\n" : MIGRATED_GITIGNORE_CONTENT;
+}
+
+function chunksOf(list, size) {
+  const out = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  return out;
+}
 
 // Obsidian's `Setting.onChange` / `Button.onClick` declare `=> void`. Handing them an
 // `async` arrow passes a promise nobody awaits, so a rejected save becomes an
@@ -394,6 +582,10 @@ class VaultForceSyncPlugin extends Plugin {
       delete this.settings.forcePush;
       await this.saveSettings();
     }
+    // Lists are normalized on load as well as on save, so an older/hand-edited
+    // data.json cannot leave paths that never match anything.
+    this.settings.excludedFolders = normalizeFolderList(this.settings.excludedFolders);
+    this.settings.syncOnlyFolders = normalizeFolderList(this.settings.syncOnlyFolders);
   }
 
   async saveSettings() {
@@ -602,7 +794,9 @@ class VaultForceSyncPlugin extends Plugin {
         return;
       }
 
-      this.ensureGitignore(vaultPath);
+      // Remove the old generated `.*` rule before the first stage. Otherwise it
+      // would keep dotfiles local even when the user has just enabled them.
+      this.migrateLegacyGitignore(vaultPath);
 
       // Keep the sync target (remote URL) pointing at the configured repo.
       await this.ensureRemote(vaultPath);
@@ -615,10 +809,17 @@ class VaultForceSyncPlugin extends Plugin {
       }
       await this.git(vaultPath, ["config", "http.postBuffer", POST_BUFFER]);
 
-      // Prevent files over the size limit from being committed/pushed,
-      // then stage everything; .gitignore keeps dotfiles / hidden files out.
+      // Add the size-skip rules. Scope rules deliberately do NOT go into
+      // `.git/info/exclude`: an ignored destination makes a move look like a
+      // deletion, which would publish the deletion of the tracked source. The
+      // post-stage filter sees the real rename instead.
       await this.excludeLargeFiles(vaultPath);
-      await this.git(vaultPath, ["add", "-A"]);
+
+      // Stage, then unstage anything the scope filter rejected. Applying the
+      // rules after staging is what lets them stop already-tracked files from
+      // being updated, and keeps moves visible as renames instead of deletions.
+      const stageOk = await this.stageVaultChanges(vaultPath);
+      if (!stageOk) return;
 
       const staged = await this.git(vaultPath, ["diff", "--cached", "--quiet"]);
       if (staged.code === 1) {
@@ -915,15 +1116,268 @@ class VaultForceSyncPlugin extends Plugin {
     this.report(`${prefix ? prefix + ", pushed " : "Pushed "}${summary} [${mode}]`, false, secs);
   }
 
-  ensureGitignore(vaultPath) {
+  // Older versions created `.gitignore` with `.*` / `!/.gitignore`. Those lines
+  // would override the new toggles, so they are removed once. Everything the
+  // user wrote around them is left alone.
+  migrateLegacyGitignore(vaultPath) {
     const file = path.join(vaultPath, ".gitignore");
-    if (fs.existsSync(file)) return;
+    let existing;
     try {
-      fs.writeFileSync(file, GITIGNORE_CONTENT, "utf8");
-      this.log("created .gitignore");
-    } catch (err) {
-      this.notify("Could not write .gitignore: " + err.message, true);
+      existing = fs.readFileSync(file, "utf8");
+    } catch (_) {
+      return; // no file: nothing generated, nothing to migrate
     }
+    const next = removeLegacyGitignoreBlock(existing);
+    if (next === existing) return;
+    try {
+      fs.writeFileSync(file, next, "utf8");
+      this.log("migrated legacy .gitignore dotfile rule");
+    } catch (err) {
+      this.notify("Could not migrate .gitignore: " + err.message, true);
+    }
+  }
+
+  // The config folder as a vault-relative path. Obsidian normally stores a name
+  // like `.obsidian`, but an absolute path is also accepted; in that case only a
+  // path inside this vault can be expressed for the filter.
+  relativeConfigDir() {
+    const configDir = this.app && this.app.vault && this.app.vault.configDir;
+    if (!configDir) return null;
+    if (!path.isAbsolute(configDir)) return normalizeFolderPath(String(configDir));
+
+    const vaultPath = getVaultPath(this.app);
+    if (!vaultPath) return null;
+    const rel = path.relative(vaultPath, configDir);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+    return normalizeFolderPath(rel.split(path.sep).join("/"));
+  }
+
+  // The plugin's own log/askpass files must never be committed, even when the
+  // user has enabled dotfolders. Returned as vault-relative folders.
+  hardExcludedFolders() {
+    const configDir = this.relativeConfigDir();
+    if (!configDir) return [];
+    const ownFolder = normalizeFolderPath(configDir + "/plugins/vault-force-sync");
+    return ownFolder ? [ownFolder] : [];
+  }
+
+  filterContext() {
+    return {
+      filters: readSyncFilters(this.settings),
+      hard: this.hardExcludedFolders(),
+    };
+  }
+
+  // Full add, or a folder-limited add when a sync-only list is configured. If
+  // the limited pathspec fails (usually a selected folder that no longer
+  // exists), fall back to a full add; filterStagedChanges still removes
+  // everything outside the scope, so the fallback is slower but not unsafe.
+  async stageVaultChanges(vaultPath) {
+    const { filters } = this.filterContext();
+    let res;
+    if (filters.syncOnlyFolders.length > 0) {
+      const paths = filters.syncOnlyFolders.map((folder) => ":(literal)" + folder);
+      res = await this.git(vaultPath, ["add", "-A", "--"].concat(paths));
+      if (res.code !== 0) {
+        this.log("folder-limited add failed (" + res.stderr.trim() + "); falling back to a full add");
+        res = await this.git(vaultPath, ["add", "-A"]);
+      }
+    } else {
+      res = await this.git(vaultPath, ["add", "-A"]);
+    }
+    if (res.code !== 0) {
+      this.report("Failed to stage changes: " + res.stderr.trim(), true);
+      return false;
+    }
+
+    // A root .gitignore is repository metadata, not vault content. Force-add it
+    // so it still follows the sync when a sync-only list is active, or when the
+    // user's own ignore rules happen to hide the file itself.
+    const dotIgnorePath = path.join(vaultPath, ".gitignore");
+    let dotIgnoreStat = null;
+    try {
+      dotIgnoreStat = fs.statSync(dotIgnorePath);
+    } catch (_) {}
+    if (dotIgnoreStat && dotIgnoreStat.isFile()) {
+      const dotIgnore = await this.git(vaultPath, ["add", "-f", "--", ":(literal).gitignore"]);
+      if (dotIgnore.code !== 0) {
+        this.report("Failed to stage .gitignore: " + dotIgnore.stderr.trim(), true);
+        return false;
+      }
+    }
+
+    return this.filterStagedChanges(vaultPath);
+  }
+
+  // Removes paths from the index after staging. Applying the rules here, rather
+  // than in a gitignore file, is what makes them work for new and tracked files
+  // alike and keeps renames from turning into published deletions.
+  async filterStagedChanges(vaultPath) {
+    // Name-status, not name-only: a rename from an included path to an excluded
+    // one is a deletion plus an addition, and resetting only the new half would
+    // publish a deletion of the old file. Renames are handled as a unit below.
+    const listed = await this.git(vaultPath, [
+      "diff",
+      "--cached",
+      "--name-status",
+      "--find-renames",
+      "-z",
+    ]);
+    if (listed.code !== 0) {
+      this.report("Failed to inspect staged changes: " + listed.stderr.trim(), true);
+      return false;
+    }
+
+    const { filters, hard } = this.filterContext();
+    const maxMB = Math.max(1, parseInt(this.settings.maxFileSizeMB, 10) || 100);
+    const limit = maxMB * 1024 * 1024;
+
+    // `--name-status -z` is: STATUS NUL [old NUL new NUL] for renames/copies,
+    // STATUS NUL path NUL for everything else.
+    const tokens = listed.stdout.split("\0");
+    const units = [];
+    for (let i = 0; i < tokens.length; ) {
+      const status = tokens[i++];
+      if (!status) continue;
+      if (status[0] === "R" || status[0] === "C") {
+        const from = tokens[i++];
+        const to = tokens[i++];
+        if (from && to) units.push({ status, paths: [from, to] });
+      } else {
+        const file = tokens[i++];
+        if (file) units.push({ status, paths: [file] });
+      }
+    }
+
+    const skip = new Set();
+    const readd = [];
+    const skippedAdds = [];
+    const deleted = [];
+    for (const unit of units) {
+      const verdicts = unit.paths.map((rel) => {
+        if (shouldSkipPath(rel, filters, hard)) return "skip";
+        // A tracked large file can be re-staged by `git add -A` after
+        // excludeLargeFiles reset it. Catch that here so the size limit holds
+        // for both new and existing files.
+        let size = 0;
+        try {
+          size = fs.statSync(path.join(vaultPath, rel)).size;
+        } catch (_) {
+          return "keep"; // deleted/renamed away: nothing to size-check
+        }
+        if (size > limit) {
+          this.log(`skipped >${maxMB}MB file after staging: ${rel} (${(size / 1048576).toFixed(1)}MB)`);
+          return "skip";
+        }
+        return "keep";
+      });
+
+      const kind = unit.status[0];
+      if (kind !== "R" && kind !== "C") {
+        if (verdicts[0] === "skip") {
+          skip.add(unit.paths[0]);
+          if (kind === "A" && !isTrashPath(unit.paths[0])) skippedAdds.push(unit.paths[0]);
+        } else if (kind === "D") {
+          deleted.push(unit.paths[0]);
+        }
+        continue;
+      }
+
+      const fromSkip = verdicts[0] === "skip";
+      const toSkip = verdicts[1] === "skip";
+      if (toSkip && !isTrashPath(unit.paths[1])) skippedAdds.push(unit.paths[1]);
+
+      // A copy leaves the source in place. Only a rename is reset as a unit;
+      // resetting the source of a copy would silently unstage its real edits.
+      if (kind === "C") {
+        if (toSkip) skip.add(unit.paths[1]);
+        if (fromSkip) skip.add(unit.paths[0]);
+        if (fromSkip && !toSkip) readd.push(unit.paths[1]);
+        continue;
+      }
+
+      if (!fromSkip && !toSkip) continue;
+      // A tracked note moved to Obsidian's trash is a deletion. Keep the source
+      // deletion staged and drop only the trash-side addition; treating it like
+      // a move into an archive folder would keep every deleted note on remote.
+      if (!fromSkip && toSkip && isTrashPath(unit.paths[1])) {
+        skip.add(unit.paths[1]);
+        continue;
+      }
+      // Otherwise reset both halves. If only the destination is in scope, add it
+      // back as a plain addition: the file moved into the synced scope should
+      // sync, and the old excluded copy stays rather than being deleted.
+      skip.add(unit.paths[0]);
+      skip.add(unit.paths[1]);
+      if (fromSkip && !toSkip) readd.push(unit.paths[1]);
+    }
+
+    // Safety net for a move git did not pair as a rename (for example, the file
+    // was rewritten heavily on the way into an excluded folder). If a deletion
+    // and a skipped addition share a basename, keep the old remote copy. This can
+    // retain a file the user meant to delete, but it cannot lose one.
+    if (skippedAdds.length > 0 && deleted.length > 0) {
+      const skippedNames = new Set(skippedAdds.map((rel) => baseName(rel)));
+      let guarded = 0;
+      for (const rel of deleted) {
+        if (!skippedNames.has(baseName(rel))) continue;
+        skip.add(rel);
+        guarded++;
+      }
+      if (guarded > 0) {
+        this.log(`kept ${guarded} deletion(s) because a same-name staged copy moved out of scope`);
+      }
+    }
+
+    // A sync-only list or an excluded folder can also receive a move as a plain
+    // untracked file, which `git diff` never sees. Check the other side of every
+    // staged deletion against untracked files that are out of scope, so moving a
+    // note out of the synced set cannot silently delete the only remote copy.
+    if (deleted.length > 0) {
+      const others = await this.git(vaultPath, ["ls-files", "--others", "--exclude-standard", "-z"]);
+      if (others.code !== 0) {
+        this.report("Failed to inspect untracked files: " + others.stderr.trim(), true);
+        return false;
+      }
+      const outsideNames = new Set();
+      for (const rel of others.stdout.split("\0")) {
+        if (rel && !isTrashPath(rel) && shouldSkipPath(rel, filters, hard)) {
+          outsideNames.add(baseName(rel));
+        }
+      }
+      let guarded = 0;
+      for (const rel of deleted) {
+        if (skip.has(rel) || !outsideNames.has(baseName(rel))) continue;
+        skip.add(rel);
+        guarded++;
+      }
+      if (guarded > 0) {
+        this.log(`kept ${guarded} deletion(s) because a same-name untracked copy is out of scope`);
+      }
+    }
+
+    if (skip.size > 0) {
+      for (const chunk of chunksOf([...skip], 100)) {
+        const paths = chunk.map((rel) => ":(literal)" + rel);
+        const res = await this.git(vaultPath, ["reset", "--quiet", "--"].concat(paths));
+        if (res.code !== 0) {
+          this.report("Failed to unstage excluded files: " + res.stderr.trim(), true);
+          return false;
+        }
+      }
+      this.log(`unstaged ${skip.size} path(s) outside the sync scope`);
+    }
+
+    if (readd.length > 0) {
+      const paths = [...new Set(readd)].map((rel) => ":(literal)" + rel);
+      const res = await this.git(vaultPath, ["add", "--"].concat(paths));
+      if (res.code !== 0) {
+        this.report("Failed to re-stage files moved into the sync scope: " + res.stderr.trim(), true);
+        return false;
+      }
+      this.log(`re-staged ${paths.length} file(s) moved into the sync scope`);
+    }
+    return true;
   }
 
   // Ensure the `origin` remote points at the configured sync target.
@@ -985,9 +1439,13 @@ class VaultForceSyncPlugin extends Plugin {
     // the file, or delete it, and an append-only list would keep that file out of
     // the repository forever, with nothing on screen to explain why it never
     // appears on the other device.
+    const { filters, hard } = this.filterContext();
     const keep = new Set();
     for (const pat of managed) {
-      if (sizeOf(path.join(vaultPath, pat.replace(/^\/+/, ""))) > limit) keep.add(pat);
+      const rel = pat.replace(/^\/+/, "");
+      // A path that is now outside the sync scope no longer needs a size rule.
+      if (shouldSkipPath(rel, filters, hard)) continue;
+      if (sizeOf(path.join(vaultPath, rel)) > limit) keep.add(pat);
     }
     const keptCount = keep.size;
 
@@ -999,14 +1457,17 @@ class VaultForceSyncPlugin extends Plugin {
       .filter(Boolean);
 
     for (const rel of candidates) {
+      if (shouldSkipPath(rel, filters, hard)) continue;
       const size = sizeOf(path.join(vaultPath, rel));
       if (size <= limit) continue;
       const pat = "/" + rel.replace(/\\/g, "/");
       if (keep.has(pat)) continue;
       keep.add(pat);
       // `.git/info/exclude` only governs untracked files, so a tracked file that
-      // is over the limit still has to be unstaged explicitly, every sync.
-      await this.git(vaultPath, ["reset", "--quiet", "--", rel]);
+      // is over the limit still has to be unstaged explicitly. The post-stage
+      // filter repeats this for modified tracked files, which `git add -A`
+      // re-stages after this method returns.
+      await this.git(vaultPath, ["reset", "--quiet", "--", ":(literal)" + rel]);
       this.log(`skipped >${maxMB}MB file: ${rel} (${(size / 1048576).toFixed(1)}MB)`);
     }
 
@@ -1132,6 +1593,7 @@ class VaultForceSyncPlugin extends Plugin {
 // sync cannot use.
 function coerce(key, value) {
   const fallback = DEFAULT_SETTINGS[key];
+  if (Array.isArray(fallback)) return normalizeFolderList(value);
   if (typeof fallback === "number") {
     const n = parseInt(value, 10);
     if (!Number.isFinite(n)) return fallback;
@@ -1183,6 +1645,101 @@ function renderSecretRow(tab, setting, item) {
   );
 }
 
+// Folder picker, loaded lazily because the test harness stubs `obsidian`
+// without the UI classes. On an Obsidian old enough to lack the modal, the text
+// field is still a complete way to add a folder.
+function openFolderSuggestModal(app, folders, onChoose) {
+  const { FuzzySuggestModal } = require("obsidian");
+  if (typeof FuzzySuggestModal !== "function") {
+    new Notice("Vault Force Sync: this Obsidian version has no folder picker; type the path instead.");
+    return;
+  }
+  class FolderSuggestModal extends FuzzySuggestModal {
+    constructor() {
+      super(app);
+      this.folders = folders;
+      this.onChoose = onChoose;
+    }
+    getItems() {
+      return this.folders;
+    }
+    getItemText(folder) {
+      return folder;
+    }
+    onChooseItem(folder) {
+      this.onChoose(folder);
+    }
+  }
+  new FolderSuggestModal().open();
+}
+
+// A folder list plus an add row, built by hand because the declarative control
+// set has no list type. Both renderers call this, so the two paths cannot drift.
+function renderFolderListRow(tab, setting, item) {
+  setting.settingEl.addClass("vault-force-sync-folder-list-setting");
+
+  const draw = () => {
+    const list = normalizeFolderList(tab.getControlValue(item.key));
+    const count = list.length
+      ? item.key === "syncOnlyFolders"
+        ? `${list.length} folder(s) selected; files elsewhere stay local.`
+        : `${list.length} folder(s) excluded.`
+      : item.key === "syncOnlyFolders"
+        ? "Empty: the whole vault is synced."
+        : "None.";
+    setting.setDesc(item.desc + " " + count);
+    setting.controlEl.empty();
+
+    const wrap = setting.controlEl.createDiv({ cls: "vault-force-sync-folder-list" });
+
+    for (const folder of list) {
+      const row = wrap.createDiv({ cls: "vault-force-sync-folder-row" });
+      row.createSpan({ cls: "vault-force-sync-folder-name", text: folder });
+      const remove = row.createEl("button", {
+        cls: "mod-warning",
+        text: "Remove",
+      });
+      remove.addEventListener(
+        "click",
+        fire(async () => {
+          await tab.removeFolder(item.key, folder);
+          draw();
+        })
+      );
+    }
+
+    const add = wrap.createDiv({ cls: "vault-force-sync-folder-add" });
+    const input = add.createEl("input", {
+      type: "text",
+      cls: "vault-force-sync-folder-input",
+      placeholder: "Folder path inside the vault",
+    });
+    const choose = add.createEl("button", { text: "Choose..." });
+    choose.addEventListener("click", () =>
+      tab.pickFolder(item.key, (folder) => {
+        input.value = folder;
+        input.focus();
+      })
+    );
+    const button = add.createEl("button", { cls: "mod-cta", text: "Add" });
+    const commit = fire(async () => {
+      if (await tab.addFolder(item.key, input.value)) {
+        input.value = "";
+        draw();
+      }
+    });
+    button.addEventListener("click", commit);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        commit();
+      }
+    });
+  };
+
+  draw();
+}
+
 // Every persisted setting, once. Both renderers read this, so the declarative
 // path used by Obsidian 1.13.0+ and the imperative path used by every version
 // before it cannot drift into disagreeing about what settings exist.
@@ -1217,6 +1774,58 @@ const SETTING_SPEC = [
         desc: "HTTP(S) proxy git uses to reach GitHub. Leave empty for no proxy.",
         type: "text",
         placeholder: "http://127.0.0.1:7890",
+      },
+    ],
+  },
+  {
+    heading: "Sync scope",
+    items: [
+      {
+        key: "excludedFolders",
+        name: "Excluded folders",
+        desc:
+          "Folders that are never staged or pushed. Matching is at a folder boundary: `Archive` covers `Archive/**`, never `Archive-old`. " +
+          "`.git`, `.trash`, and this plugin's own folder are always excluded. Files that were already tracked before you excluded a folder stay in the repository; the plugin never deletes them from the remote on its own.",
+        type: "folder-list",
+      },
+      {
+        key: "syncOnlyFolders",
+        name: "Sync only these folders",
+        desc:
+          "Empty = sync the whole vault. When set, only files under these folders are staged, plus the root .gitignore control file; everything else stays local. " +
+          "Excluded folders and the name filters below still take precedence, so a whitelisted folder is not rescued from them.",
+        type: "folder-list",
+      },
+      {
+        key: "excludeHiddenFiles",
+        name: "Exclude dot-prefixed (hidden) files",
+        desc:
+          "Never sync files whose name starts with a dot: .env, .DS_Store. This is the hidden-file rule on macOS/Linux; " +
+          "Windows hidden attributes are not inspected. The vault's root .gitignore is kept as a repository control file. On by default.",
+        type: "toggle",
+      },
+      {
+        key: "excludeDotFolders",
+        name: "Exclude dot-prefixed (hidden) folders",
+        desc:
+          "Never sync folders whose name starts with a dot and everything inside them: .obsidian, .archive. " +
+          ".git and .trash stay excluded even when this is off. On by default.",
+        type: "toggle",
+      },
+      {
+        key: "excludeUnderscoreFiles",
+        name: "Exclude underscore-prefixed files",
+        desc:
+          "Never sync files whose name starts with an underscore: _draft.md, _template.canvas. " +
+          "Off by default because these are often real notes.",
+        type: "toggle",
+      },
+      {
+        key: "excludeUnderscoreFolders",
+        name: "Exclude underscore-prefixed folders",
+        desc:
+          "Never sync folders whose name starts with an underscore and everything inside them. Off by default.",
+        type: "toggle",
       },
     ],
   },
@@ -1332,6 +1941,8 @@ class VaultForceSyncSettingTab extends PluginSettingTab {
 
         if (item.type === "secret") {
           def.render = (setting) => renderSecretRow(this, setting, item);
+        } else if (item.type === "folder-list") {
+          def.render = (setting) => renderFolderListRow(this, setting, item);
         } else {
           def.control = {
             type: item.type,
@@ -1362,6 +1973,51 @@ class VaultForceSyncSettingTab extends PluginSettingTab {
     await this.plugin.saveSettings();
   }
 
+  async addFolder(key, raw) {
+    const folder = normalizeFolderPath(raw);
+    if (!folder) {
+      new Notice("Vault Force Sync: enter a folder inside the vault (the vault root cannot be used).");
+      return false;
+    }
+    const list = normalizeFolderList(this.plugin.settings[key]);
+    if (list.includes(folder)) {
+      new Notice("Vault Force Sync: that folder is already in the list.");
+      return false;
+    }
+    this.plugin.settings[key] = list.concat(folder);
+    await this.plugin.saveSettings();
+    return true;
+  }
+
+  async removeFolder(key, folder) {
+    const list = normalizeFolderList(this.plugin.settings[key]);
+    this.plugin.settings[key] = list.filter((entry) => entry !== folder);
+    await this.plugin.saveSettings();
+  }
+
+  getVaultFolders() {
+    try {
+      const files = this.app.vault.getAllLoadedFiles();
+      return files
+        .filter((file) => file && Array.isArray(file.children))
+        .map((file) => normalizeFolderPath(file.path))
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  pickFolder(key, onChoose) {
+    const list = normalizeFolderList(this.plugin.settings[key]);
+    const candidates = this.getVaultFolders().filter((folder) => !list.includes(folder));
+    if (candidates.length === 0) {
+      new Notice("Vault Force Sync: no more folders to choose; type a path instead.");
+      return;
+    }
+    openFolderSuggestModal(this.app, candidates, onChoose);
+  }
+
   // The pre-1.13 renderer. `display()` is abstract, so it stays; 1.13.0 and later
   // render from `getSettingDefinitions()` instead. Both read SETTING_SPEC.
   display() {
@@ -1383,6 +2039,9 @@ class VaultForceSyncSettingTab extends PluginSettingTab {
         }
 
         switch (item.type) {
+          case "folder-list":
+            renderFolderListRow(this, setting, item);
+            break;
           case "text":
             setting.addText((text) =>
               text
