@@ -29,11 +29,19 @@ async function runOne(name, fn) {
     await fn();
     return ["PASS", name, ""];
   } catch (e) {
+    // A machine that cannot answer the probe is not a plugin failure; say which
+    // one did not run instead of reporting a red suite.
+    if (e && e.skipReason) return ["SKIP", name, e.skipReason];
     return ["FAIL", name, e.message];
   }
 }
 function assert(c, m) {
   if (!c) throw new Error(m);
+}
+function skip(reason) {
+  const e = new Error(`skipped: ${reason}`);
+  e.skipReason = reason;
+  throw e;
 }
 
 // --- obsidian stub -----------------------------------------------------------
@@ -320,13 +328,22 @@ check("with no token configured, git falls back to the machine's own helper", as
   assert(auth.args.length === 0 && auth.env === null, "the default path must not be modified");
 
   // Sanity check on the machine we are running on: its helper answers, proving the
-  // helper list was not cleared by accident.
+  // helper list was not cleared by accident. Whether it answers depends on this
+  // machine having a stored GitHub credential, so a silent helper is reported as
+  // a skip rather than a failure — the assertions above already pin the contract.
+  const helpers = execFileSync("git", ["config", "--get-all", "credential.helper"], {
+    encoding: "utf8",
+  }).trim();
+  if (!helpers) skip("this machine configures no git credential helper");
+
   const res = spawnSync("git", ["credential", "fill"], {
     input: "protocol=https\nhost=github.com\n\n",
     encoding: "utf8",
     env: Object.assign({}, process.env, { GIT_TERMINAL_PROMPT: "0" }),
   });
-  assert(/^password=/m.test(res.stdout), "this machine's helper did not respond; other tests are less meaningful");
+  if (!/^password=/m.test(res.stdout)) {
+    skip(`helper "${helpers}" returned no stored credential for github.com`);
+  }
 });
 
 // --- configDir ---------------------------------------------------------------
@@ -412,11 +429,16 @@ check("the helper exists even when the token was never typed", async () => {
   const results = [];
   for (const [name, fn] of checks) results.push(await runOne(name, fn));
   let failed = 0;
+  let skipped = 0;
   for (const [status, name, err] of results) {
     if (status === "FAIL") failed++;
+    if (status === "SKIP") skipped++;
     console.log(`${status}  ${name}`);
     if (err) console.log(`      ${err}`);
   }
-  console.log(`\n${results.length - failed}/${results.length} passed`);
+  console.log(
+    `\n${results.length - skipped - failed}/${results.length - skipped} passed` +
+      (skipped ? `, ${skipped} skipped` : "")
+  );
   process.exit(failed ? 1 : 0);
 })();

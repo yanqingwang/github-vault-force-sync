@@ -259,6 +259,8 @@ sh tests/run.sh        # the whole suite, 78 checks
 
 These are not unit tests over a mocked git. A merge that silently conflicts, or a push that runs before the pull, is invisible to a stub — so every scenario creates real repositories, a real bare remote, and drives the real binary. The credential tests run `git credential fill` and assert on what git actually hands back. The safety tests build the exact nested-vault layout that makes the repository-root check necessary, and then assert the parent project was left byte-for-byte untouched.
 
+One credential check also probes *this machine*: whether its own git helper answers for `github.com`. That depends on the laptop it runs on, not on the plugin, so when no stored credential exists the check reports `SKIP` with the reason — the assertions on the plugin's behaviour in that same check still run.
+
 ## License
 
 [MIT](./LICENSE)
