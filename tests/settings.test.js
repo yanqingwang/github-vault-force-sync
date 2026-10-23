@@ -103,6 +103,7 @@ const DEFAULTS = {
   enableLogging: true,
   maxFileSizeMB: 100,
   excludedFolders: [],
+  excludedFiles: [],
   syncOnlyFolders: [],
   excludeHiddenFiles: true,
   excludeDotFolders: true,
@@ -186,10 +187,10 @@ check("dropdowns declare their options", async () => {
   assert(strat.control.options.merge && strat.control.options.rebase, "syncStrategy lost its options");
 });
 
-check("folder lists are rendered rows, not single-value controls", async () => {
+check("folder and file lists are rendered rows, not single-value controls", async () => {
   const { tab } = await boot();
   const items = tab.getSettingDefinitions().flatMap((g) => g.items);
-  for (const name of ["Excluded folders", "Sync only these folders"]) {
+  for (const name of ["Excluded folders", "Excluded files", "Sync only these folders"]) {
     const row = items.find((i) => i.name === name);
     assert(row, `missing row: ${name}`);
     assert(typeof row.render === "function", `${name} has no renderer`);
@@ -244,21 +245,30 @@ check("maxFileSizeMB refuses zero, which would skip every file", async () => {
   assert(tab.plugin.settings.maxFileSizeMB === 250, "a valid size was rejected");
 });
 
-check("folder paths are normalized, de-duplicated, and root is refused", async () => {
+check("path lists normalize, de-duplicate, and refuse the vault root", async () => {
   const { tab } = await boot();
-  assert(await tab.addFolder("excludedFolders", "  Notes\\Archive/  "), "a valid folder was refused");
+  assert(await tab.addPath("excludedFolders", "  Notes\\Archive/  "), "a valid folder was refused");
   assert(
     JSON.stringify(tab.plugin.settings.excludedFolders) === JSON.stringify(["Notes/Archive"]),
     `not normalized: ${JSON.stringify(tab.plugin.settings.excludedFolders)}`
   );
-  assert(!(await tab.addFolder("excludedFolders", "Notes/Archive")), "a duplicate was accepted");
+  assert(!(await tab.addPath("excludedFolders", "Notes/Archive")), "a duplicate was accepted");
   for (const bad of ["", ".", "/", "Notes/../Secret", "./"]) {
-    assert(!(await tab.addFolder("excludedFolders", bad)), `the root/escaping path "${bad}" was accepted`);
+    assert(!(await tab.addPath("excludedFolders", bad)), `the root/escaping path "${bad}" was accepted`);
   }
   assert(
     tab.plugin.settings.excludedFolders.length === 1,
     "a rejected path changed the stored list"
   );
+
+  // The file list is the same list machine: a file path is stored verbatim, and
+  // the same refusals apply.
+  assert(await tab.addPath("excludedFiles", " Inbox/secrets.md "), "a valid file was refused");
+  assert(
+    JSON.stringify(tab.plugin.settings.excludedFiles) === JSON.stringify(["Inbox/secrets.md"]),
+    `file path not normalized: ${JSON.stringify(tab.plugin.settings.excludedFiles)}`
+  );
+  assert(!(await tab.addPath("excludedFiles", "../escape.md")), "a path escaping the vault was accepted");
 
   await tab.setControlValue("syncOnlyFolders", [" Notes/ ", "Notes", "Other"]);
   assert(
@@ -266,8 +276,38 @@ check("folder paths are normalized, de-duplicated, and root is refused", async (
     `list values were not normalized: ${JSON.stringify(tab.plugin.settings.syncOnlyFolders)}`
   );
 
-  await tab.removeFolder("excludedFolders", "Notes/Archive");
+  await tab.removePath("excludedFolders", "Notes/Archive");
   assert(tab.plugin.settings.excludedFolders.length === 0, "remove did not persist");
+});
+
+check("the folder picker offers folders and the file picker offers files", async () => {
+  const { tab } = await boot({ excludedFiles: ["Notes/a.md"] });
+  tab.app.vault.getAllLoadedFiles = () => [
+    { path: "Notes", children: [] },
+    { path: "Inbox", children: [] },
+    { path: "Notes/a.md" },
+    { path: "Notes/b.canvas" },
+  ];
+  assert(
+    JSON.stringify(tab.getVaultFolders()) === JSON.stringify(["Inbox", "Notes"]),
+    `folders wrong: ${JSON.stringify(tab.getVaultFolders())}`
+  );
+  assert(
+    JSON.stringify(tab.getVaultFiles()) === JSON.stringify(["Notes/a.md", "Notes/b.canvas"]),
+    `files wrong: ${JSON.stringify(tab.getVaultFiles())}`
+  );
+
+  // An entry already in the list is not offered again, and on an Obsidian with no
+  // FuzzySuggestModal the picker says so instead of throwing -- typing the path
+  // remains the supported path.
+  let chose = null;
+  notices.length = 0;
+  tab.pickFile("excludedFiles", (p) => (chose = p));
+  assert(chose === null, "a modal opened on a stub without FuzzySuggestModal");
+  assert(
+    notices.some((n) => /no path picker/.test(n)),
+    `the fallback was not reported: ${JSON.stringify(notices)}`
+  );
 });
 
 check("validation rejects what coerce would silently fix", async () => {

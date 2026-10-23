@@ -92,10 +92,12 @@ const DEFAULT_SETTINGS = {
   showSuccessNotice: true,
   enableLogging: true,
   maxFileSizeMB: 100,
-  // Sync scope. These mirror the Nextcloud-style controls: folder lists are
-  // vault-relative, matched at folder boundaries, and the name filters are
-  // independent of each other.
+  // Sync scope. These mirror the Nextcloud-style controls: folder entries are
+  // matched at folder boundaries, file entries at their exact vault-relative
+  // path, and the name filters are independent of each other. Exclusions always
+  // outrank the sync-only selection.
   excludedFolders: [],
+  excludedFiles: [],
   syncOnlyFolders: [],
   // Dot-prefixed names are the "hidden" names on macOS/Linux, and Obsidian's
   // own config folder is a dotfolder. Defaults preserve the plugin's historical
@@ -218,9 +220,9 @@ const MIGRATED_GITIGNORE_CONTENT = [
 // safely sync its own metadata, and Obsidian's trash is device-local.
 const HARD_EXCLUDED_FOLDERS = [".git", ".trash"];
 
-// Vault-relative folder path, "/"-separated. Returns null for the vault root and
-// for anything that would escape it. No glob/wildcard syntax: this is a folder
-// prefix, not a pattern language.
+// Vault-relative path, "/"-separated -- a folder or a file, the shape is the
+// same. Returns null for the vault root and for anything that would escape it.
+// No glob/wildcard syntax: these are literal paths, not a pattern language.
 function normalizeFolderPath(input) {
   if (typeof input !== "string") return null;
   let p = input.trim();
@@ -295,6 +297,7 @@ function readSyncFilters(settings) {
   const s = settings || {};
   return {
     excludedFolders: normalizeFolderList(s.excludedFolders),
+    excludedFiles: normalizeFolderList(s.excludedFiles),
     syncOnlyFolders: normalizeFolderList(s.syncOnlyFolders),
     excludeHiddenFiles:
       s.excludeHiddenFiles === undefined
@@ -316,8 +319,9 @@ function readSyncFilters(settings) {
 }
 
 // The one decision every staging path goes through. Precedence mirrors the
-// Nextcloud plugin: hard exclusions, user exclusions, name filters, then the
-// sync-only whitelist. A whitelisted folder can never rescue an excluded one.
+// Nextcloud plugin: hard exclusions, the user's folder and file lists, name
+// filters, then the sync-only whitelist. A whitelisted folder can never rescue
+// an excluded path.
 function shouldSkipPath(relPath, filters, extraHardFolders) {
   const p = String(relPath || "").replace(/\\/g, "/").replace(/^\/+/, "");
   if (!p) return false;
@@ -329,6 +333,7 @@ function shouldSkipPath(relPath, filters, extraHardFolders) {
   const hard = HARD_EXCLUDED_FOLDERS.concat(extraHardFolders || []);
   if (isUnderFolder(p, hard)) return true;
   if (isUnderFolder(p, filters.excludedFolders)) return true;
+  if (filters.excludedFiles.includes(p)) return true;
   if (filters.excludeHiddenFiles && baseName(p).startsWith(".")) return true;
   if (filters.excludeDotFolders && isUnderDotFolder(p)) return true;
   if (filters.excludeUnderscoreFiles && baseName(p).startsWith("_")) return true;
@@ -585,6 +590,7 @@ class VaultForceSyncPlugin extends Plugin {
     // Lists are normalized on load as well as on save, so an older/hand-edited
     // data.json cannot leave paths that never match anything.
     this.settings.excludedFolders = normalizeFolderList(this.settings.excludedFolders);
+    this.settings.excludedFiles = normalizeFolderList(this.settings.excludedFiles);
     this.settings.syncOnlyFolders = normalizeFolderList(this.settings.syncOnlyFolders);
   }
 
@@ -1645,45 +1651,48 @@ function renderSecretRow(tab, setting, item) {
   );
 }
 
-// Folder picker, loaded lazily because the test harness stubs `obsidian`
-// without the UI classes. On an Obsidian old enough to lack the modal, the text
-// field is still a complete way to add a folder.
-function openFolderSuggestModal(app, folders, onChoose) {
+// Vault-relative path picker, loaded lazily because the test harness stubs
+// `obsidian` without the UI classes. It lists whatever the caller resolved --
+// folders or files -- so both lists get the same fuzzy search. On an Obsidian old
+// enough to lack the modal, the text field is still a complete way to add a path.
+function openPathSuggestModal(app, paths, onChoose) {
   const { FuzzySuggestModal } = require("obsidian");
   if (typeof FuzzySuggestModal !== "function") {
-    new Notice("Vault Force Sync: this Obsidian version has no folder picker; type the path instead.");
+    new Notice("Vault Force Sync: this Obsidian version has no path picker; type the path instead.");
     return;
   }
-  class FolderSuggestModal extends FuzzySuggestModal {
+  class PathSuggestModal extends FuzzySuggestModal {
     constructor() {
       super(app);
-      this.folders = folders;
+      this.paths = paths;
       this.onChoose = onChoose;
     }
     getItems() {
-      return this.folders;
+      return this.paths;
     }
-    getItemText(folder) {
-      return folder;
+    getItemText(entry) {
+      return entry;
     }
-    onChooseItem(folder) {
-      this.onChoose(folder);
+    onChooseItem(entry) {
+      this.onChoose(entry);
     }
   }
-  new FolderSuggestModal().open();
+  new PathSuggestModal().open();
 }
 
-// A folder list plus an add row, built by hand because the declarative control
-// set has no list type. Both renderers call this, so the two paths cannot drift.
+// A path list plus an add row, built by hand because the declarative control set
+// has no list type. Folders and files share it and differ only in what the picker
+// offers, so neither list can drift from the other. Both renderers call this.
 function renderFolderListRow(tab, setting, item) {
   setting.settingEl.addClass("vault-force-sync-folder-list-setting");
+  const isFile = item.picker === "file";
 
   const draw = () => {
     const list = normalizeFolderList(tab.getControlValue(item.key));
     const count = list.length
       ? item.key === "syncOnlyFolders"
         ? `${list.length} folder(s) selected; files elsewhere stay local.`
-        : `${list.length} folder(s) excluded.`
+        : `${list.length} ${isFile ? "file" : "folder"}(s) excluded.`
       : item.key === "syncOnlyFolders"
         ? "Empty: the whole vault is synced."
         : "None.";
@@ -1692,9 +1701,9 @@ function renderFolderListRow(tab, setting, item) {
 
     const wrap = setting.controlEl.createDiv({ cls: "vault-force-sync-folder-list" });
 
-    for (const folder of list) {
+    for (const entry of list) {
       const row = wrap.createDiv({ cls: "vault-force-sync-folder-row" });
-      row.createSpan({ cls: "vault-force-sync-folder-name", text: folder });
+      row.createSpan({ cls: "vault-force-sync-folder-name", text: entry });
       const remove = row.createEl("button", {
         cls: "mod-warning",
         text: "Remove",
@@ -1702,7 +1711,7 @@ function renderFolderListRow(tab, setting, item) {
       remove.addEventListener(
         "click",
         fire(async () => {
-          await tab.removeFolder(item.key, folder);
+          await tab.removePath(item.key, entry);
           draw();
         })
       );
@@ -1712,18 +1721,18 @@ function renderFolderListRow(tab, setting, item) {
     const input = add.createEl("input", {
       type: "text",
       cls: "vault-force-sync-folder-input",
-      placeholder: "Folder path inside the vault",
+      placeholder: isFile ? "File path inside the vault" : "Folder path inside the vault",
     });
     const choose = add.createEl("button", { text: "Choose..." });
     choose.addEventListener("click", () =>
-      tab.pickFolder(item.key, (folder) => {
-        input.value = folder;
+      (isFile ? tab.pickFile : tab.pickFolder)(item.key, (picked) => {
+        input.value = picked;
         input.focus();
       })
     );
     const button = add.createEl("button", { cls: "mod-cta", text: "Add" });
     const commit = fire(async () => {
-      if (await tab.addFolder(item.key, input.value)) {
+      if (await tab.addPath(item.key, input.value)) {
         input.value = "";
         draw();
       }
@@ -1789,11 +1798,21 @@ const SETTING_SPEC = [
         type: "folder-list",
       },
       {
+        key: "excludedFiles",
+        name: "Excluded files",
+        desc:
+          "Individual files that are never staged or pushed, matched by their exact path inside the vault: `Inbox/secrets.md`. " +
+          "A folder does not belong here -- use Excluded folders, which also covers everything inside it. A file that is already tracked stays in the repository. " +
+          "Exclusions outrank Sync only these folders.",
+        type: "folder-list",
+        picker: "file",
+      },
+      {
         key: "syncOnlyFolders",
         name: "Sync only these folders",
         desc:
           "Empty = sync the whole vault. When set, only files under these folders are staged, plus the root .gitignore control file; everything else stays local. " +
-          "Excluded folders and the name filters below still take precedence, so a whitelisted folder is not rescued from them.",
+          "Excluded folders, excluded files and the name filters below still take precedence, so a whitelisted folder is not rescued from them.",
         type: "folder-list",
       },
       {
@@ -1973,25 +1992,25 @@ class VaultForceSyncSettingTab extends PluginSettingTab {
     await this.plugin.saveSettings();
   }
 
-  async addFolder(key, raw) {
-    const folder = normalizeFolderPath(raw);
-    if (!folder) {
-      new Notice("Vault Force Sync: enter a folder inside the vault (the vault root cannot be used).");
+  async addPath(key, raw) {
+    const entry = normalizeFolderPath(raw);
+    if (!entry) {
+      new Notice("Vault Force Sync: enter a path inside the vault (the vault root cannot be used).");
       return false;
     }
     const list = normalizeFolderList(this.plugin.settings[key]);
-    if (list.includes(folder)) {
-      new Notice("Vault Force Sync: that folder is already in the list.");
+    if (list.includes(entry)) {
+      new Notice("Vault Force Sync: that path is already in the list.");
       return false;
     }
-    this.plugin.settings[key] = list.concat(folder);
+    this.plugin.settings[key] = list.concat(entry);
     await this.plugin.saveSettings();
     return true;
   }
 
-  async removeFolder(key, folder) {
+  async removePath(key, entry) {
     const list = normalizeFolderList(this.plugin.settings[key]);
-    this.plugin.settings[key] = list.filter((entry) => entry !== folder);
+    this.plugin.settings[key] = list.filter((item) => item !== entry);
     await this.plugin.saveSettings();
   }
 
@@ -2008,14 +2027,39 @@ class VaultForceSyncSettingTab extends PluginSettingTab {
     }
   }
 
+  // Obsidian only has the files it has loaded in memory. Anything not in that
+  // list can still be typed into the field by hand.
+  getVaultFiles() {
+    try {
+      const files = this.app.vault.getAllLoadedFiles();
+      return files
+        .filter((file) => file && !Array.isArray(file.children))
+        .map((file) => normalizeFolderPath(file.path))
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  pickFrom(onChoose, candidates, emptyNotice) {
+    if (candidates.length === 0) {
+      new Notice(emptyNotice);
+      return;
+    }
+    openPathSuggestModal(this.app, candidates, onChoose);
+  }
+
   pickFolder(key, onChoose) {
     const list = normalizeFolderList(this.plugin.settings[key]);
     const candidates = this.getVaultFolders().filter((folder) => !list.includes(folder));
-    if (candidates.length === 0) {
-      new Notice("Vault Force Sync: no more folders to choose; type a path instead.");
-      return;
-    }
-    openFolderSuggestModal(this.app, candidates, onChoose);
+    this.pickFrom(onChoose, candidates, "Vault Force Sync: no more folders to choose; type a path instead.");
+  }
+
+  pickFile(key, onChoose) {
+    const list = normalizeFolderList(this.plugin.settings[key]);
+    const candidates = this.getVaultFiles().filter((file) => !list.includes(file));
+    this.pickFrom(onChoose, candidates, "Vault Force Sync: no more files to choose; type a path instead.");
   }
 
   // The pre-1.13 renderer. `display()` is abstract, so it stays; 1.13.0 and later

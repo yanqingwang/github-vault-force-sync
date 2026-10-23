@@ -87,6 +87,7 @@ const BASE_SETTINGS = {
   credentialUsername: "",
   credentialSecretId: "",
   excludedFolders: [],
+  excludedFiles: [],
   syncOnlyFolders: [],
   excludeHiddenFiles: true,
   excludeDotFolders: true,
@@ -277,6 +278,58 @@ check("a nested excluded folder matches only its own subtree", async () => {
   assert(!has(repo, "Notes/Archive/x.md"), "the nested excluded folder was committed");
   assert(has(repo, "Notes/Archive-old/y.md"), "the folder-boundary rule was not respected");
   assert(has(repo, "Notes/keep.md"), "an ordinary sibling was excluded");
+});
+
+check("an excluded file is held back while everything around it syncs", async () => {
+  const repo = makeRepo();
+  for (const file of ["Inbox/secret.md", "Inbox/notes.md", "secret.md", "Other/secret.md"]) {
+    write(repo, file);
+  }
+
+  await sync(repo, { excludedFiles: ["Inbox/secret.md", "secret.md"] });
+
+  assert(!has(repo, "Inbox/secret.md"), "the excluded file was committed");
+  assert(!has(repo, "secret.md"), "the excluded root-level file was committed");
+  assert(has(repo, "Inbox/notes.md"), "a sibling in the same folder was excluded");
+  assert(has(repo, "Other/secret.md"), "an entry matched beyond its exact path");
+});
+
+check("an already-tracked excluded file keeps its remote copy and stops taking edits", async () => {
+  const repo = makeRepo((dir) => {
+    fs.mkdirSync(path.join(dir, "Inbox"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "Inbox", "token.md"), "original\n");
+  });
+  write(repo, "Inbox/token.md", "changed locally\n");
+  write(repo, "Inbox/other.md");
+
+  await sync(repo, { excludedFiles: ["Inbox/token.md"] });
+
+  assert(has(repo, "Inbox/token.md"), "excluding a tracked file untracked it");
+  assert(show(repo, "Inbox/token.md").trim() === "original", "the excluded tracked file was updated");
+  assert(has(repo, "Inbox/other.md"), "a sibling should still sync");
+  assert(
+    /Inbox\/token\.md/.test(git(repo, ["status", "--porcelain"])),
+    "the excluded local edit should stay in the working tree"
+  );
+
+  // A local deletion of an excluded file must not be published either; dropping it
+  // from the repository is something the user does on purpose with `git rm`.
+  fs.unlinkSync(path.join(repo, "Inbox", "token.md"));
+  await sync(repo, { excludedFiles: ["Inbox/token.md"] });
+  assert(has(repo, "Inbox/token.md"), "deleting an excluded tracked file locally removed it from the repository");
+});
+
+check("excluded files outrank the sync-only whitelist", async () => {
+  const repo = makeRepo();
+  for (const file of ["Notes/a.md", "Notes/b.md", "Notes/c.md"]) {
+    write(repo, file);
+  }
+
+  await sync(repo, { syncOnlyFolders: ["Notes"], excludedFiles: ["Notes/b.md"] });
+
+  assert(has(repo, "Notes/a.md"), "a whitelisted file was lost");
+  assert(has(repo, "Notes/c.md"), "a whitelisted file was lost");
+  assert(!has(repo, "Notes/b.md"), "the whitelist rescued an explicitly excluded file");
 });
 
 check("sync-only restricts staging to the selected folders", async () => {
